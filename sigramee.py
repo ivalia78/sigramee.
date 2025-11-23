@@ -263,8 +263,6 @@ def init_db():
                 ('4102', 'Pendapatan Lainnya', 'Pendapatan'),
                 # Beban
                 ('5101', 'HPP Ikan Gurame', 'Beban'), 
-                ('5105', 'HPP Ikan Gurame', 'Beban'), 
-                ('5106', 'Beban Pakan Ikan', 'Beban'), 
                 ('6101', 'Beban Akomodasi', 'Beban'), 
                 ('6102', 'Beban Listrik dan Air', 'Beban'), 
                 ('6103', 'Beban Perlengkapan', 'Beban'), 
@@ -286,14 +284,14 @@ def init_db():
                 INSERT OR IGNORE INTO inventory_items 
                 (item_name, inventory_account, expense_cogs_account, sales_account, sale_price_per_unit) 
                 VALUES (?, ?, ?, ?, ?)""",
-                ('Ikan Gurame', '1105', '5105', '4101', '15000')
+                ('Ikan Gurame', '1105', '5101', '4101', '15000')
             )
             # Item 2: Pakan Ikan
             db.execute("""
                 INSERT OR IGNORE INTO inventory_items 
                 (item_name, inventory_account, expense_cogs_account, sales_account, sale_price_per_unit) 
                 VALUES (?, ?, ?, ?, ?)""",
-                ('Pakan Ikan', '1108', '5106', None, 0)
+                ('Pakan Ikan', '1108', '6105', None, 0)
             )
             # Item 3: Obat-obatan (BARU)
             db.execute("""
@@ -4007,21 +4005,35 @@ def delete_accounts():
     db = get_db()
     error_msg = None
     
-    with db:
-        for code in codes_to_delete:
-            try:
-                # Coba hapus
-                db.execute("DELETE FROM chart_of_accounts WHERE account_code = ?", (code,))
-            except sqlite3.IntegrityError:
-                # Gagal karena ON DELETE RESTRICT (akun sudah dipakai di journal_details)
-                error_msg = f"Satu atau lebih akun (termasuk {code}) tidak dapat dihapus karena sudah digunakan dalam jurnal."
+    # Kita gunakan blok try-except di luar loop untuk keamanan transaksi,
+    # atau di dalam loop jika ingin menghapus yang bisa dihapus saja.
+    # Di sini saya gunakan pendekatan: Coba hapus satu per satu.
+    
+    try:
+        with db:
+            for code in codes_to_delete:
+                try:
+                    db.execute("DELETE FROM chart_of_accounts WHERE account_code = ?", (code,))
+                except sqlite3.IntegrityError:
+                    # Tangkap error jika akun sedang digunakan di jurnal
+                    # Kita simpan pesan error, tapi loop tetap lanjut (biar akun lain tetap terhapus jika dipilih banyak)
+                    error_msg = f"Gagal menghapus akun {code}: Akun ini sudah digunakan dalam jurnal transaksi."
+    except Exception as e:
+        # Error umum lain (misal koneksi db)
+        error_msg = f"Terjadi kesalahan sistem: {str(e)}"
 
-# ==================================
-# NERACA SALDO AWAL
-# ==================================
+    # === BAGIAN PENTING YANG SEBELUMNYA HILANG ===
+    
+    if error_msg:
+        # Jika ada error, kembali ke halaman akun dengan membawa pesan error di URL
+        return redirect(url_for('chart_of_accounts', error=error_msg))
+    else:
+        # Jika sukses tanpa error, kembali bersih
+        return redirect(url_for('chart_of_accounts'))
+    
 @app.route("/admin/opening-balance", methods=['GET', 'POST'])
 def opening_balance():
-    """Halaman untuk menginput neraca saldo awal secara manual"""
+    """Halaman untuk menginput neraca saldo awal & Info Perusahaan secara manual"""
     if session.get('role') != 'admin':
         return redirect(url_for('index'))
     
@@ -4029,38 +4041,43 @@ def opening_balance():
     error_message = None
     success_message = None
     
-    # Ambil data perusahaan dan periode yang sudah tersimpan (jika ada)
-    company_info = db.execute("SELECT * FROM company_info LIMIT 1").fetchone()
-    
+    # 1. Ambil data perusahaan saat ini untuk ditampilkan
+    try:
+        company_info = db.execute("SELECT * FROM company_info LIMIT 1").fetchone()
+    except:
+        company_info = None # Handle jika tabel belum ada
+
+    # ==========================================
+    # LOGIKA PENYIMPANAN (POST)
+    # ==========================================
     if request.method == 'POST':
         try:
             with db:
-                # Ambil input nama perusahaan dan periode
+                # A. SIMPAN INFORMASI PERUSAHAAN
                 nama_perusahaan = request.form.get('company_name', '').strip()
                 periode_akuntansi = request.form.get('accounting_period', '').strip()
                 
-                # Simpan atau update data perusahaan
-                if company_info:
-                    db.execute(
-                        "UPDATE company_info SET company_name = ?, accounting_period = ? WHERE id = ?",
-                        (nama_perusahaan, periode_akuntansi, company_info['id'])
-                    )
+                # Cek apakah tabel company_info ada, jika tidak buat (opsional/safety)
+                db.execute("CREATE TABLE IF NOT EXISTS company_info (id INTEGER PRIMARY KEY, company_name TEXT, accounting_period TEXT)")
+                
+                existing_company = db.execute("SELECT id FROM company_info LIMIT 1").fetchone()
+                if existing_company:
+                    db.execute("UPDATE company_info SET company_name = ?, accounting_period = ? WHERE id = ?", 
+                               (nama_perusahaan, periode_akuntansi, existing_company['id']))
                 else:
-                    db.execute(
-                        "INSERT INTO company_info (company_name, accounting_period) VALUES (?, ?)",
-                        (nama_perusahaan, periode_akuntansi)
-                    )
-                
-                # Lanjutkan dengan proses neraca saldo awal seperti sebelumnya
+                    db.execute("INSERT INTO company_info (company_name, accounting_period) VALUES (?, ?)", 
+                               (nama_perusahaan, periode_akuntansi))
+
+                # B. SIMPAN JURNAL SALDO AWAL
+                # 1. Hapus Saldo Awal lama jika ada
                 saldo_awal_entry = db.execute("SELECT id FROM journal_entries WHERE description LIKE '%Saldo Awal%' LIMIT 1").fetchone()
-                
                 entry_id = None
                 
                 if saldo_awal_entry:
                     db.execute("DELETE FROM journal_details WHERE entry_id = ?", (saldo_awal_entry['id'],))
                     entry_id = saldo_awal_entry['id']
                 else:
-                    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    # Buat Header Jurnal Baru
                     journal_code = generate_journal_code(db, datetime.strptime('2025-01-01', '%Y-%m-%d'))
                     cursor = db.execute(
                         "INSERT INTO journal_entries (journal_code, entry_timestamp, description) VALUES (?, ?, ?)",
@@ -4071,183 +4088,76 @@ def opening_balance():
                 total_debit = Decimal('0')
                 total_credit = Decimal('0')
                 
+                # Tampung nilai aset tetap dulu untuk perhitungan server-side (backup jika JS gagal)
                 aset_tetap_values = {}
-                akumulasi_penyusutan_values = {}
-                
+                for key, value in request.form.items():
+                    if key.startswith('balance_'):
+                        code = key.replace('balance_', '')
+                        val = Decimal(str(float(value))) if value and value.strip() else Decimal('0')
+                        if code in ['1201', '1203', '1205', '1207']: # Kode Aset Induk
+                            aset_tetap_values[code] = val
+
+                # Loop semua input balance
                 for key, value in request.form.items():
                     if key.startswith('balance_'):
                         account_code = key.replace('balance_', '')
                         balance_value = Decimal(str(float(value))) if value and value.strip() else Decimal('0')
                         
-                        if account_code in ['1201', '1203', '1205', '1207']:
-                            aset_tetap_values[account_code] = balance_value
-                
-                for key, value in request.form.items():
-                    if key.startswith('balance_'):
-                        account_code = key.replace('balance_', '')
-                        balance_value = Decimal(str(float(value))) if value and value.strip() else Decimal('0')
+                        # Cek tipe akun untuk normal balance
+                        account_info = db.execute("SELECT account_type, account_name FROM chart_of_accounts WHERE account_code = ?", (account_code,)).fetchone()
                         
-                        if account_code in ['1202', '1204', '1206']:
-                            corresponding_asset = None
-                            masa_manfaat = 0
-                            tahun_pakai = 0
+                        if account_info and balance_value != 0:
+                            account_type = account_info['account_type']
+                            account_name = account_info['account_name'].lower()
                             
-                            if account_code == '1202':
-                                corresponding_asset = '1201'
-                                masa_manfaat_val = request.form.get('masa_manfaat_1201', '5')
-                                tahun_pakai_val = request.form.get('tahun_pakai_1201', '1')
-                                masa_manfaat = Decimal(str(float(masa_manfaat_val))) if masa_manfaat_val else Decimal('5')
-                                tahun_pakai = Decimal(str(float(tahun_pakai_val))) if tahun_pakai_val else Decimal('1')
-                            elif account_code == '1204':
-                                corresponding_asset = '1203'
-                                masa_manfaat_val = request.form.get('masa_manfaat_1203', '8')
-                                tahun_pakai_val = request.form.get('tahun_pakai_1203', '1')
-                                masa_manfaat = Decimal(str(float(masa_manfaat_val))) if masa_manfaat_val else Decimal('8')
-                                tahun_pakai = Decimal(str(float(tahun_pakai_val))) if tahun_pakai_val else Decimal('1')
-                            elif account_code == '1206':
-                                corresponding_asset = '1205'
-                                masa_manfaat_val = request.form.get('masa_manfaat_1205', '20')
-                                tahun_pakai_val = request.form.get('tahun_pakai_1205', '1')
-                                masa_manfaat = Decimal(str(float(masa_manfaat_val))) if masa_manfaat_val else Decimal('20')
-                                tahun_pakai = Decimal(str(float(tahun_pakai_val))) if tahun_pakai_val else Decimal('1')
+                            debit_val = 0.0
+                            credit_val = 0.0
+
+                            # Logika Debit/Kredit Berdasarkan Tipe Akun
+                            is_contra_asset = 'akumulasi' in account_name and 'penyusutan' in account_name
                             
-                            if corresponding_asset and corresponding_asset in aset_tetap_values:
-                                nilai_aset = aset_tetap_values[corresponding_asset]
-                                if nilai_aset > 0 and masa_manfaat > 0:
-                                    penyusutan_per_tahun = nilai_aset / masa_manfaat
-                                    akumulasi_penyusutan = penyusutan_per_tahun * tahun_pakai
-                                    balance_value = akumulasi_penyusutan
-                                    akumulasi_penyusutan_values[account_code] = akumulasi_penyusutan
-                        
-                        if balance_value != 0:
-                            account_info = db.execute(
-                                "SELECT account_type, account_name FROM chart_of_accounts WHERE account_code = ?", 
-                                (account_code,)
-                            ).fetchone()
+                            # Kelompok DEBIT (Normal)
+                            if account_type in ('Aset Lancar', 'Aset Tetap', 'Beban') and not is_contra_asset:
+                                if balance_value > 0: # Positif masuk Debit
+                                    debit_val = float(balance_value)
+                                else: # Negatif masuk Kredit
+                                    credit_val = float(abs(balance_value))
                             
-                            if account_info:
-                                account_type = account_info['account_type']
-                                account_name = account_info['account_name']
-                                
-                                if 'akumulasi' in account_name.lower() and 'penyusutan' in account_name.lower():
-                                    if balance_value > 0:
-                                        debit_val = 0.0
-                                        credit_val = float(balance_value)
-                                        db.execute(
-                                            "INSERT INTO journal_details (entry_id, account_code, debit, credit) VALUES (?, ?, ?, ?)",
-                                            (entry_id, account_code, debit_val, credit_val)
-                                        )
-                                        total_credit += balance_value
-                                    else:
-                                        debit_val = float(abs(balance_value))
-                                        credit_val = 0.0
-                                        db.execute(
-                                            "INSERT INTO journal_details (entry_id, account_code, debit, credit) VALUES (?, ?, ?, ?)",
-                                            (entry_id, account_code, debit_val, credit_val)
-                                        )
-                                        total_debit += abs(balance_value)
-                                
-                                elif account_type == 'Beban' or 'beban penyusutan' in account_name.lower():
-                                    if balance_value > 0:
-                                        debit_val = float(balance_value)
-                                        credit_val = 0.0
-                                        db.execute(
-                                            "INSERT INTO journal_details (entry_id, account_code, debit, credit) VALUES (?, ?, ?, ?)",
-                                            (entry_id, account_code, debit_val, credit_val)
-                                        )
-                                        total_debit += balance_value
-                                    else:
-                                        debit_val = 0.0
-                                        credit_val = float(abs(balance_value))
-                                        db.execute(
-                                            "INSERT INTO journal_details (entry_id, account_code, debit, credit) VALUES (?, ?, ?, ?)",
-                                            (entry_id, account_code, debit_val, credit_val)
-                                        )
-                                        total_credit += abs(balance_value)
-                                
-                                elif account_type in ('Aset Lancar', 'Aset Tetap', 'Beban'):
-                                    if balance_value > 0:
-                                        debit_val = float(balance_value)
-                                        credit_val = 0.0
-                                        db.execute(
-                                            "INSERT INTO journal_details (entry_id, account_code, debit, credit) VALUES (?, ?, ?, ?)",
-                                            (entry_id, account_code, debit_val, credit_val)
-                                        )
-                                        total_debit += balance_value
-                                    else:
-                                        debit_val = 0.0
-                                        credit_val = float(abs(balance_value))
-                                        db.execute(
-                                            "INSERT INTO journal_details (entry_id, account_code, debit, credit) VALUES (?, ?, ?, ?)",
-                                            (entry_id, account_code, debit_val, credit_val)
-                                        )
-                                        total_credit += abs(balance_value)
-                                else:
-                                    if balance_value > 0:
-                                        debit_val = 0.0
-                                        credit_val = float(balance_value)
-                                        db.execute(
-                                            "INSERT INTO journal_details (entry_id, account_code, debit, credit) VALUES (?, ?, ?, ?)",
-                                            (entry_id, account_code, debit_val, credit_val)
-                                        )
-                                        total_credit += balance_value
-                                    else:
-                                        debit_val = float(abs(balance_value))
-                                        credit_val = 0.0
-                                        db.execute(
-                                            "INSERT INTO journal_details (entry_id, account_code, debit, credit) VALUES (?, ?, ?, ?)",
-                                            (entry_id, account_code, debit_val, credit_val)
-                                        )
-                                        total_debit += abs(balance_value)
+                            # Kelompok KREDIT (Normal)
+                            else: 
+                                if balance_value > 0: # Positif masuk Kredit
+                                    credit_val = float(balance_value)
+                                else: # Negatif masuk Debit
+                                    debit_val = float(abs(balance_value))
+
+                            # Insert Detail
+                            if debit_val > 0 or credit_val > 0:
+                                db.execute("INSERT INTO journal_details (entry_id, account_code, debit, credit) VALUES (?, ?, ?, ?)",
+                                           (entry_id, account_code, debit_val, credit_val))
+                                total_debit += Decimal(str(debit_val))
+                                total_credit += Decimal(str(credit_val))
                 
                 if total_debit != total_credit:
                     error_message = f"Neraca Saldo Awal tidak balance! Debit: {format_currency(total_debit)}, Kredit: {format_currency(total_credit)}"
                     db.rollback()
                 else:
-                    success_message = f"Neraca Saldo Awal berhasil disimpan! Total: {format_currency(total_debit)}"
+                    success_message = f"Data Perusahaan & Saldo Awal berhasil disimpan! Total: {format_currency(total_debit)}"
+                    # Refresh data perusahaan untuk tampilan
+                    company_info = db.execute("SELECT * FROM company_info LIMIT 1").fetchone()
                     
         except Exception as e:
             error_message = f"Terjadi kesalahan: {str(e)}"
             import traceback
-            print("Error details:", traceback.format_exc())
-            try:
-                db.rollback()
-            except:
-                pass
+            print(traceback.format_exc())
+            try: db.rollback()
+            except: pass
 
-    # Ambil data perusahaan yang sudah tersimpan untuk ditampilkan di form
-    company_info = db.execute("SELECT * FROM company_info LIMIT 1").fetchone()
-    
-    # Form input perusahaan dan periode
-    company_form = f"""
-    <div style="background-color: #e7f3ff; padding: 20px; border-radius: 5px; margin-bottom: 30px; border-left: 4px solid #007bff;">
-        <h3 style="margin-top: 0; color: #0056b3;">🏢 Informasi Perusahaan</h3>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
-            <div>
-                <label style="display: block; margin-bottom: 5px; font-weight: bold;">Nama Perusahaan:</label>
-                <input type="text" name="company_name" value="{company_info['company_name'] if company_info else ''}" 
-                       placeholder="Contoh: PT Contoh Indonesia" 
-                       style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
-            </div>
-            <div>
-                <label style="display: block; margin-bottom: 5px; font-weight: bold;">Periode Akuntansi:</label>
-                <input type="text" name="accounting_period" value="{company_info['accounting_period'] if company_info else ''}" 
-                       placeholder="Contoh: 2025, atau Januari-Desember 2025" 
-                       style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
-            </div>
-        </div>
-        <p style="margin: 0; font-size: 0.9em; color: #666;">
-            💡 Informasi ini akan digunakan untuk semua laporan keuangan termasuk Laporan Laba Rugi
-        </p>
-    </div>
-    """
-
+    # ==========================================
+    # LOGIKA TAMPILAN (GET)
+    # ==========================================
     try:
         accounts = db.execute("""
-            SELECT 
-                coa.account_code,
-                coa.account_name,
-                coa.account_type
+            SELECT coa.account_code, coa.account_name, coa.account_type
             FROM chart_of_accounts coa
             ORDER BY 
                 CASE coa.account_type
@@ -4258,16 +4168,41 @@ def opening_balance():
                     WHEN 'Pendapatan' THEN 5
                     WHEN 'Beban' THEN 6
                     ELSE 7
-                END,
-                coa.account_code
+                END, coa.account_code
         """).fetchall()
-    except Exception as e:
-        error_message = f"Gagal mengambil data akun: {str(e)}"
+    except:
         accounts = []
 
+    # --- 1. FORM DATA PERUSAHAAN ---
+    company_name_val = company_info['company_name'] if company_info else ''
+    company_period_val = company_info['accounting_period'] if company_info else ''
+    
+    company_form_html = f"""
+    <div style="background-color: #e7f3ff; padding: 20px; border-radius: 5px; margin-bottom: 30px; border-left: 4px solid #007bff;">
+        <h3 style="margin-top: 0; color: #0056b3;">🏢 Informasi Perusahaan</h3>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+            <div>
+                <label style="display: block; margin-bottom: 5px; font-weight: bold;">Nama Perusahaan:</label>
+                <input type="text" name="company_name" value="{company_name_val}" 
+                       placeholder="Contoh: PT Maju Jaya" required
+                       style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px;">
+            </div>
+            <div>
+                <label style="display: block; margin-bottom: 5px; font-weight: bold;">Periode Akuntansi:</label>
+                <input type="text" name="accounting_period" value="{company_period_val}" 
+                       placeholder="Contoh: 2025" required
+                       style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px;">
+            </div>
+        </div>
+        <small style="color: #666;">*Data ini akan ditampilkan pada kop laporan keuangan.</small>
+    </div>
+    """
+
+    # --- 2. LOOP AKUN UNTUK FORM ---
     account_inputs = ""
     current_type = ""
     
+    # Mapping Aset ke Akumulasi (Code Aset: Data Config)
     aset_penyusutan_map = {
         '1201': {'nama': 'Peralatan', 'akumulasi': '1202', 'default_masa_manfaat': 5},
         '1203': {'nama': 'Kendaraan', 'akumulasi': '1204', 'default_masa_manfaat': 8},
@@ -4280,215 +4215,460 @@ def opening_balance():
             if current_type != "":
                 account_inputs += "</tbody></table><br>"
             
-            extra_instructions = ""
-            if account['account_type'] == 'Aset Tetap':
-                extra_instructions = """
-                <div style="background-color: #e7f3ff; padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid #007bff;">
-                    <strong>💡 Petunjuk Aset Tetap:</strong> 
-                    <ul style="margin: 5px 0; padding-left: 20px;">
-                        <li>Masukkan nilai perolehan aset tetap (Normal: Debit)</li>
-                        <li>Akumulasi Penyusutan akan otomatis dihitung (Normal: <strong style="color: #dc3545;">Kredit</strong>)</li>
-                        <li>Beban Penyusutan (Normal: <strong style="color: #28a745;">Debit</strong>)</li>
-                        <li>Tanah tidak disusutkan</li>
-                    </ul>
-                </div>
-                """
-            
+            # Judul Kategori
             account_inputs += f"""
-            <h4>{account['account_type']}</h4>
-            {extra_instructions}
-            <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+            <h4 style="border-bottom: 2px solid #ddd; padding-bottom: 5px; margin-top: 20px;">{account['account_type']}</h4>
+            <table style="width: 100%; border-collapse: collapse; margin-bottom: 10px;">
                 <thead>
-                    <tr style="background-color: #f2f2f2;">
-                        <th style="padding: 10px; border: 1px solid #ddd;">Kode Akun</th>
-                        <th style="padding: 10px; border: 1px solid #ddd;">Nama Akun</th>
-                        <th style="padding: 10px; border: 1px solid #ddd;">Input Saldo Awal</th>
-                        <th style="padding: 10px; border: 1px solid #ddd;">Keterangan</th>
+                    <tr style="background-color: #f8f9fa; color: #495057;">
+                        <th style="padding: 10px; border: 1px solid #dee2e6; width: 15%;">Kode</th>
+                        <th style="padding: 10px; border: 1px solid #dee2e6; width: 35%;">Nama Akun</th>
+                        <th style="padding: 10px; border: 1px solid #dee2e6; width: 25%;">Saldo Awal</th>
+                        <th style="padding: 10px; border: 1px solid #dee2e6; width: 25%;">Keterangan</th>
                     </tr>
                 </thead>
                 <tbody>
             """
             current_type = account['account_type']
 
-        if 'akumulasi' in account['account_name'].lower() and 'penyusutan' in account['account_name'].lower():
-            normal_balance = "Kredit"
-            balance_color = "color: #dc3545; font-weight: bold;"
-        elif 'beban penyusutan' in account['account_name'].lower():
-            normal_balance = "Debit"
-            balance_color = "color: #28a745; font-weight: bold;"
-        elif account['account_type'] in ('Aset Lancar', 'Aset Tetap', 'Beban'):
-            normal_balance = "Debit"
-            balance_color = "color: #28a745;"
+        # --- MULAI PENGGANTIAN ---
+        
+        # 1. Tentukan Default Saldo Normal (Debit vs Kredit)
+        if account['account_type'] in ('Aset Lancar', 'Aset Tetap', 'Beban'):
+            # Grup Debit (Warna Hijau)
+            note_text = "Normal: <span style='color: #28a745; font-weight: bold;'>Debit</span>"
         else:
-            normal_balance = "Kredit"
-            balance_color = "color: #dc3545;"
+            # Grup Kredit: Liabilitas, Ekuitas, Pendapatan (Warna Merah)
+            note_text = "Normal: <span style='color: #dc3545; font-weight: bold;'>Kredit</span>"
+
+        # 2. Styling Khusus & Pengecualian (Kontra Aset)
+        row_style = ""
         
-        is_aset_tetap = account['account_code'] in aset_penyusutan_map
-        has_akumulasi = is_aset_tetap and aset_penyusutan_map[account['account_code']]['akumulasi'] is not None
-        is_akumulasi_penyusutan = 'akumulasi' in account['account_name'].lower() and 'penyusutan' in account['account_name'].lower()
-        is_beban_penyusutan = 'beban penyusutan' in account['account_name'].lower()
+        if 'akumulasi' in account['account_name'].lower() and 'penyusutan' in account['account_name'].lower():
+            row_style = "background-color: #fff3cd;" # Background Kuning
+            # Akumulasi adalah Aset tapi saldonya Kredit (Kontra)
+            note_text = "⚠️ Kontra Aset (<span style='color: #dc3545; font-weight: bold;'>Kredit</span>)"
+            
+        elif account['account_type'] == 'Beban':
+            row_style = "background-color: #fbfcfd;" # Background Putih Abu sedikit biar beda
+
+        # 3. Cek fitur hitung otomatis untuk Javascript
+        code = account['account_code']
+        is_asset_parent = code in aset_penyusutan_map
+        has_calc_feature = is_asset_parent and aset_penyusutan_map[code]['akumulasi'] is not None
         
-        extra_fields = ""
-        if is_aset_tetap and has_akumulasi:
-            default_masa_manfaat = aset_penyusutan_map[account['account_code']]['default_masa_manfaat']
-            extra_fields = f"""
-            <tr style="background-color: #f8f9fa;">
-                <td colspan="2" style="padding: 8px; border: 1px solid #ddd; text-align: right; font-size: 0.9em;">
-                    <strong>Perhitungan Penyusutan:</strong>
+        # --- AKHIR PENGGANTIAN ---
+            
+        # Cek apakah ini Aset Tetap yang punya fitur hitung otomatis
+        code = account['account_code']
+        is_asset_parent = code in aset_penyusutan_map
+        has_calc_feature = is_asset_parent and aset_penyusutan_map[code]['akumulasi'] is not None
+
+        # Input Field Akun Utama
+        account_inputs += f"""
+        <tr style="{row_style}">
+            <td style="padding: 8px; border: 1px solid #dee2e6; text-align: center;">{code}</td>
+            <td style="padding: 8px; border: 1px solid #dee2e6;">{account['account_name']}</td>
+            <td style="padding: 8px; border: 1px solid #dee2e6;">
+                <input type="number" step="0.01" 
+                       name="balance_{code}" 
+                       id="balance_{code}"
+                       placeholder="0"
+                       style="width: 100%; padding: 6px; border: 1px solid #ccc; border-radius: 4px;"
+                       {'onkeyup="hitungPenyusutan(\'' + code + '\')"' if has_calc_feature else ''}>
+            </td>
+            <td style="padding: 8px; border: 1px solid #dee2e6; font-size: 0.85em; color: #666;">
+                {note_text}
+            </td>
+        </tr>
+        """
+        
+        # Input Field Tambahan (Masa Manfaat & Tahun Pakai) -> Muncul di bawah Aset Induk
+        if has_calc_feature:
+            default_life = aset_penyusutan_map[code]['default_masa_manfaat']
+            account_inputs += f"""
+            <tr style="background-color: #fdfdfe;">
+                <td colspan="2" style="text-align: right; padding: 8px; border-bottom: 1px solid #dee2e6; color: #007bff;">
+                    <small><strong>⚙️ Kalkulator Penyusutan:</strong></small>
                 </td>
-                <td style="padding: 8px; border: 1px solid #ddd;">
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 5px;">
-                        <div>
-                            <label style="font-size: 0.8em;">Masa Manfaat (tahun):</label>
-                            <input type="number" name="masa_manfaat_{account['account_code']}" 
-                                   value="{default_masa_manfaat}" min="1" max="50" 
-                                   style="width: 100%; padding: 3px; font-size: 0.8em;"
-                                   onchange="hitungPenyusutan('{account['account_code']}')">
+                <td colspan="2" style="padding: 8px; border-bottom: 1px solid #dee2e6;">
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <div style="flex: 1;">
+                            <small>Masa Manfaat (Thn):</small>
+                            <input type="number" name="masa_manfaat_{code}" id="masa_manfaat_{code}" 
+                                   value="{default_life}" min="1" 
+                                   style="width: 100%; padding: 4px; border: 1px solid #ddd;"
+                                   onkeyup="hitungPenyusutan('{code}')" onchange="hitungPenyusutan('{code}')">
                         </div>
-                        <div>
-                            <label style="font-size: 0.8em;">Tahun Pakai:</label>
-                            <input type="number" name="tahun_pakai_{account['account_code']}" 
-                                   value="1" min="0" max="50" 
-                                   style="width: 100%; padding: 3px; font-size: 0.8em;"
-                                   onchange="hitungPenyusutan('{account['account_code']}')">
+                        <div style="flex: 1;">
+                            <small>Tahun Pakai:</small>
+                            <input type="number" name="tahun_pakai_{code}" id="tahun_pakai_{code}" 
+                                   value="0" min="0" 
+                                   style="width: 100%; padding: 4px; border: 1px solid #ddd;"
+                                   onkeyup="hitungPenyusutan('{code}')" onchange="hitungPenyusutan('{code}')">
                         </div>
                     </div>
-                </td>
-                <td style="padding: 8px; border: 1px solid #ddd; font-size: 0.8em;">
-                    <div id="info_penyusutan_{account['account_code']}">
-                        Penyusutan/tahun: Rp 0<br>
-                        Akumulasi: Rp 0
-                    </div>
+                    <div id="info_text_{code}" style="margin-top: 5px; font-size: 0.85em; color: #28a745; font-weight: bold;"></div>
                 </td>
             </tr>
             """
-        
-        row_style = ""
-        account_note = ""
-        
-        if is_akumulasi_penyusutan:
-            row_style = "background-color: #fff3cd;"
-            account_note = '<br><em style="color: #dc3545;">*Akun Kontra Aset (Kredit)</em>'
-        elif is_beban_penyusutan:
-            row_style = "background-color: #d4edda;"
-            account_note = '<br><em style="color: #28a745;">*Beban (Debit)</em>'
-        
-        account_inputs += f"""
-        <tr style="{row_style}">
-            <td style="padding: 8px; border: 1px solid #ddd;">{account['account_code']}</td>
-            <td style="padding: 8px; border: 1px solid #ddd;">{account['account_name']}</td>
-            <td style="padding: 8px; border: 1px solid #ddd;">
-                <input type="number" 
-                       name="balance_{account['account_code']}" 
-                       value=""
-                       step="0.01" 
-                       style="width: 100%; padding: 5px;"
-                       placeholder="0.00"
-                       {'onchange="hitungPenyusutan(\'' + account['account_code'] + '\')"' if is_aset_tetap and has_akumulasi else ''}>
-            </td>
-            <td style="padding: 8px; border: 1px solid #ddd; font-size: 0.9em; color: #666;">
-                <span style="{balance_color}">Normal balance: {normal_balance}</span>
-                {'' if not has_akumulasi else '<br><em style="color: #007bff;">*Dapat disusutkan</em>'}
-                {account_note}
-            </td>
-        </tr>
-        {extra_fields}
-        """
     
     account_inputs += "</tbody></table>"
 
-    # ... (bagian saldo display dan sisanya tetap sama)
+    # --- 3. TABLE DATA TERSIMPAN (PREVIEW) ---
+    # (Opsional: Ambil data existing untuk preview di bawah form, kode sama seperti sebelumnya)
+    saldo_table_html = "<tr><td colspan='4' style='text-align:center; padding:10px;'>Belum ada data</td></tr>"
+    # ... (Kode preview saldo Anda yang lama bisa ditaruh di sini jika mau, saya sederhanakan agar fokus ke fungsi utama)
+
+    # --- 4. SUSUN HALAMAN UTAMA ---
+    body = f"""
+    <style>
+        .btn-save {{ background-color: #28a745; color: white; border: none; padding: 12px 25px; border-radius: 5px; cursor: pointer; font-size: 16px; }}
+        .btn-save:hover {{ background-color: #218838; }}
+        .btn-reset {{ background-color: #6c757d; color: white; border: none; padding: 12px 25px; border-radius: 5px; cursor: pointer; font-size: 16px; margin-left: 10px; }}
+    </style>
+
+    {f'<div style="background: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px; margin-bottom: 20px;">{error_message}</div>' if error_message else ''}
+    {f'<div style="background: #d4edda; color: #155724; padding: 15px; border-radius: 5px; margin-bottom: 20px;">{success_message}</div>' if success_message else ''}
+
+    <form method="POST" action="/admin/opening-balance" onsubmit="return confirm('Simpan Neraca Saldo Awal? Data lama akan ditimpa.');">
+        
+        {company_form_html}
+        
+        <div style="background: white; padding: 20px; border: 1px solid #ddd; border-radius: 5px;">
+            <h3 style="margin-top: 0; border-bottom: 2px solid #007bff; padding-bottom: 10px;">💰 Input Saldo Awal Akun</h3>
+            <div style="background: #fff3cd; padding: 10px; margin-bottom: 15px; border-radius: 4px; font-size: 0.9em;">
+                 <strong>Petunjuk:</strong>
+                 <ul style="margin: 5px 0; padding-left: 20px;">
+                    <li>Masukkan saldo positif saja. Sistem otomatis menentukan Debit/Kredit.</li>
+                    <li>Untuk <strong>Aset Tetap</strong>, isi "Nilai Aset", "Masa Manfaat", & "Tahun Pakai".</li>
+                    <li>Kolom <strong>Akumulasi Penyusutan</strong> akan terisi otomatis!</li>
+                 </ul>
+            </div>
+
+            {account_inputs}
+            
+            <div style="text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee;">
+                <button type="submit" class="btn-save">💾 Simpan Semua Data</button>
+                <button type="button" class="btn-reset" onclick="if(confirm('Reset form?')) document.querySelector('form').reset();">🔄 Reset</button>
+            </div>
+        </div>
+    </form>
+
+    <script>
+    // Map Kode Aset -> Kode Akumulasi
+    const assetToAccumMap = {{
+        '1201': '1202', // Peralatan -> Akum. Peralatan
+        '1203': '1204', // Kendaraan -> Akum. Kendaraan
+        '1205': '1206'  // Bangunan -> Akum. Bangunan
+    }};
+
+    function formatRupiah(angka) {{
+        return new Intl.NumberFormat('id-ID', {{ style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }}).format(angka);
+    }}
+
+    function hitungPenyusutan(assetCode) {{
+        // 1. Tentukan Kode Akumulasi Pasangannya
+        const accumCode = assetToAccumMap[assetCode];
+        if (!accumCode) return;
+
+        // 2. Ambil Elemen Input
+        const elAsset = document.getElementById('balance_' + assetCode);
+        const elLife  = document.getElementById('masa_manfaat_' + assetCode);
+        const elYears = document.getElementById('tahun_pakai_' + assetCode);
+        
+        // Input Target (Akumulasi)
+        const elAccumInput = document.getElementById('balance_' + accumCode);
+        // Teks Info
+        const elInfoText = document.getElementById('info_text_' + assetCode);
+
+        // 3. Ambil Nilai (Konversi ke Float, default 0)
+        let valAsset = parseFloat(elAsset.value) || 0;
+        let valLife  = parseFloat(elLife.value)  || 0;
+        let valYears = parseFloat(elYears.value) || 0;
+
+        // 4. Rumus Perhitungan
+        let depPerYear = 0;
+        let totalAccum = 0;
+
+        if (valLife > 0) {{
+            depPerYear = valAsset / valLife;
+            totalAccum = depPerYear * valYears;
+        }}
+
+        // 5. UPDATE FIELD INPUT AKUMULASI (Ini yang sebelumnya kurang)
+        if (elAccumInput) {{
+            // Masukkan hasil hitungan ke input box akumulasi
+            // Kita bulatkan agar rapi, atau biarkan desimal
+            elAccumInput.value = Math.round(totalAccum); 
+        }}
+
+        // 6. Update Teks Info untuk User
+        if (elInfoText) {{
+            if (totalAccum > 0) {{
+                elInfoText.innerHTML = `Penyusutan/Thn: ${{formatRupiah(depPerYear)}} | Total Akumulasi: ${{formatRupiah(totalAccum)}} (Auto-filled)`;
+            }} else {{
+                elInfoText.innerHTML = "";
+            }}
+        }}
+    }}
+    </script>
+    """
+    # ==========================================
+    # B. PERSIAPAN DATA TAMPILAN (GET METHOD)
+    # ==========================================
+    
+    # 1. Ambil Daftar Akun Master
+    try:
+        accounts = db.execute("""
+            SELECT coa.account_code, coa.account_name, coa.account_type
+            FROM chart_of_accounts coa
+            ORDER BY 
+                CASE coa.account_type
+                    WHEN 'Aset Lancar' THEN 1 WHEN 'Aset Tetap' THEN 2 WHEN 'Liabilitas' THEN 3
+                    WHEN 'Ekuitas' THEN 4 WHEN 'Pendapatan' THEN 5 WHEN 'Beban' THEN 6 ELSE 7
+                END, coa.account_code
+        """).fetchall()
+    except:
+        accounts = []
+
+    # 2. Generate HTML Form Input
+    company_name_val = company_info['company_name'] if company_info else ''
+    company_period_val = company_info['accounting_period'] if company_info else ''
+    
+    # -- Form Bagian Atas (Perusahaan) --
+    company_form_html = f"""
+    <div style="background-color: #e7f3ff; padding: 20px; border-radius: 5px; margin-bottom: 20px; border-left: 4px solid #007bff;">
+        <h3 style="margin-top: 0; color: #0056b3;">🏢 Informasi Perusahaan</h3>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+            <div>
+                <label style="font-weight: bold;">Nama Perusahaan:</label>
+                <input type="text" name="company_name" value="{company_name_val}" placeholder="Contoh: PT Maju Jaya" required style="width: 100%; padding: 8px;">
+            </div>
+            <div>
+                <label style="font-weight: bold;">Periode Akuntansi:</label>
+                <input type="text" name="accounting_period" value="{company_period_val}" placeholder="Contoh: 2025" required style="width: 100%; padding: 8px;">
+            </div>
+        </div>
+    </div>
+    """
+
+    # -- Loop Form Akun --
+    account_inputs = ""
+    current_type = ""
+    aset_penyusutan_map = {
+        '1201': {'akumulasi': '1202', 'default': 5},
+        '1203': {'akumulasi': '1204', 'default': 8},
+        '1205': {'akumulasi': '1206', 'default': 20}
+    }
+    
+    for account in accounts:
+        if account['account_type'] != current_type:
+            if current_type != "": account_inputs += "</tbody></table><br>"
+            account_inputs += f"""
+            <h4 style="border-bottom: 2px solid #ddd; margin-top: 15px;">{account['account_type']}</h4>
+            <table style="width: 100%; border-collapse: collapse;">
+                <thead>
+                    <tr style="background: #f8f9fa;">
+                        <th style="padding:8px; border:1px solid #ddd; width:15%">Kode</th>
+                        <th style="padding:8px; border:1px solid #ddd; width:35%">Nama Akun</th>
+                        <th style="padding:8px; border:1px solid #ddd; width:25%">Saldo Awal</th>
+                        <th style="padding:8px; border:1px solid #ddd; width:25%">Ket</th>
+                    </tr>
+                </thead><tbody>
+            """
+            current_type = account['account_type']
+
+        # Styling Logic
+        row_bg = ""
+        # Tentukan Normal Balance Text
+        if account['account_type'] in ('Aset Lancar', 'Aset Tetap', 'Beban'):
+            ket_html = "<span style='color:#28a745; font-weight:bold;'>Debit</span>"
+        else:
+            ket_html = "<span style='color:#dc3545; font-weight:bold;'>Kredit</span>"
+
+        # Override untuk Akumulasi
+        if 'akumulasi' in account['account_name'].lower() and 'penyusutan' in account['account_name'].lower():
+            row_bg = "background-color: #fff3cd;"
+            ket_html = "⚠️ Kontra Aset (<span style='color:#dc3545; font-weight:bold;'>Kredit</span>)"
+        elif account['account_type'] == 'Beban':
+            row_bg = "background-color: #fbfcfd;"
+
+        code = account['account_code']
+        has_calc = code in aset_penyusutan_map
+        
+        # Baris Akun Utama
+        account_inputs += f"""
+        <tr style="{row_bg}">
+            <td style="padding:8px; border:1px solid #ddd; text-align:center;">{code}</td>
+            <td style="padding:8px; border:1px solid #ddd;">{account['account_name']}</td>
+            <td style="padding:8px; border:1px solid #ddd;">
+                <input type="number" step="0.01" name="balance_{code}" id="balance_{code}" placeholder="0"
+                       style="width:100%; padding:5px;" {'onkeyup="hitungPenyusutan(\''+code+'\')"' if has_calc else ''}>
+            </td>
+            <td style="padding:8px; border:1px solid #ddd; font-size:0.85em; color:#555;">Normal: {ket_html}</td>
+        </tr>
+        """
+        
+        # Baris Kalkulator (Hidden by default unless asset)
+        if has_calc:
+            default_life = aset_penyusutan_map[code]['default']
+            account_inputs += f"""
+            <tr style="background:#fdfdfe;">
+                <td colspan="2" style="text-align:right; padding:5px; border-bottom:1px solid #ddd; color:#007bff;"><small>⚙️ Kalkulator:</small></td>
+                <td colspan="2" style="padding:5px; border-bottom:1px solid #ddd;">
+                    <div style="display:flex; gap:5px;">
+                        <input type="number" id="masa_{code}" value="{default_life}" style="width:50px;" onkeyup="hitungPenyusutan('{code}')"> <small>Thn (Masa)</small>
+                        <input type="number" id="pakai_{code}" value="0" style="width:50px;" onkeyup="hitungPenyusutan('{code}')"> <small>Thn (Pakai)</small>
+                    </div>
+                    <div id="info_{code}" style="font-size:0.8em; color:#28a745; margin-top:2px;"></div>
+                </td>
+            </tr>
+            """
+    account_inputs += "</tbody></table>"
+    
+    # MENAMPILKAN DATA YANG SUDAH TERSIMPAN (PREVIEW TABLE)
+    try:
+        saved_data = db.execute("""
+            SELECT jd.account_code, coa.account_name, coa.account_type, SUM(jd.debit) as deb, SUM(jd.credit) as cred
+            FROM journal_details jd
+            JOIN chart_of_accounts coa ON jd.account_code = coa.account_code
+            JOIN journal_entries je ON jd.entry_id = je.id
+            WHERE je.description LIKE '%Saldo Awal%'
+            GROUP BY jd.account_code
+            ORDER BY CASE coa.account_type
+                    WHEN 'Aset Lancar' THEN 1 WHEN 'Aset Tetap' THEN 2 WHEN 'Liabilitas' THEN 3
+                    WHEN 'Ekuitas' THEN 4 WHEN 'Pendapatan' THEN 5 WHEN 'Beban' THEN 6 ELSE 7
+                END, jd.account_code
+        """).fetchall()
+    except:
+        saved_data = []
+
+    saved_table_rows = ""
+    total_saved_debit = Decimal('0')
+    total_saved_credit = Decimal('0')
+    curr_saved_type = ""
+
+    if not saved_data:
+        saved_table_rows = "<tr><td colspan='4' style='text-align:center; padding:20px; color:#999;'>Belum ada data tersimpan. Silakan input di atas.</td></tr>"
+    else:
+        for row in saved_data:
+            # Header Kategori di Tabel Preview
+            if row['account_type'] != curr_saved_type:
+                saved_table_rows += f"<tr style='background:#e9ecef;'><td colspan='4' style='padding:8px; font-weight:bold;'>{row['account_type']}</td></tr>"
+                curr_saved_type = row['account_type']
+            
+            d_val = Decimal(str(row['deb']))
+            c_val = Decimal(str(row['cred']))
+            total_saved_debit += d_val
+            total_saved_credit += c_val
+            
+            saved_table_rows += f"""
+            <tr>
+                <td style="padding:8px; border:1px solid #ddd;">{row['account_code']}</td>
+                <td style="padding:8px; border:1px solid #ddd;">{row['account_name']}</td>
+                <td style="padding:8px; border:1px solid #ddd; text-align:right;">{format_currency(d_val) if d_val > 0 else '-'}</td>
+                <td style="padding:8px; border:1px solid #ddd; text-align:right;">{format_currency(c_val) if c_val > 0 else '-'}</td>
+            </tr>
+            """
+    
+    # Footer Total Tabel Preview
+    balance_status = "✅ BALANCE" if total_saved_debit == total_saved_credit and total_saved_debit > 0 else "❌ TIDAK BALANCE"
+    balance_color = "#28a745" if total_saved_debit == total_saved_credit and total_saved_debit > 0 else "#dc3545"
+
+    preview_html = f"""
+    <div style="margin-top: 40px; background: white; padding: 20px; border: 1px solid #ddd; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
+        <h3 style="margin-top: 0; color: #333; border-bottom: 2px solid #28a745; padding-bottom: 10px;">📊 Data Neraca Saldo Tersimpan</h3>
+        <table style="width: 100%; border-collapse: collapse;">
+            <thead>
+                <tr style="background: #343a40; color: white;">
+                    <th style="padding:10px;">Kode</th>
+                    <th style="padding:10px;">Nama Akun</th>
+                    <th style="padding:10px; text-align:right;">Debit</th>
+                    <th style="padding:10px; text-align:right;">Kredit</th>
+                </tr>
+            </thead>
+            <tbody>
+                {saved_table_rows}
+                <tr style="background: #f8f9fa; font-weight:bold;">
+                    <td colspan="2" style="padding:10px; text-align:right;">TOTAL</td>
+                    <td style="padding:10px; text-align:right; color:#28a745;">{format_currency(total_saved_debit)}</td>
+                    <td style="padding:10px; text-align:right; color:#dc3545;">{format_currency(total_saved_credit)}</td>
+                </tr>
+                <tr style="background: {balance_color}; color: white; font-weight:bold;">
+                    <td colspan="4" style="padding:10px; text-align:center;">STATUS: {balance_status}</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+    """
 
     body = f"""
     <style>
-        .opening-balance-form {{
-            background-color: #f9f9f9;
-            padding: 20px;
-            border-radius: 5px;
-            border: 1px solid #ddd;
-            margin-bottom: 30px;
-        }}
-        .saldo-display {{
-            background-color: white;
-            padding: 20px;
-            border-radius: 5px;
-            border: 1px solid #ddd;
-            margin-bottom: 30px;
-        }}
-        .instructions {{
-            background-color: #f8f9fa;
-            padding: 15px;
-            border-radius: 5px;
-            margin-top: 20px;
-        }}
-        .contra-account {{
-            background-color: #fff3cd !important;
-        }}
-        .beban-account {{
-            background-color: #d4edda !important;
-        }}
-        .saldo-table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 10px;
-        }}
-        .saldo-table th {{
-            background-color: #007bff;
-            color: white;
-            padding: 12px;
-            border: 1px solid #ddd;
-            text-align: center;
-        }}
-        .saldo-table td {{
-            padding: 10px;
-            border: 1px solid #ddd;
-        }}
-        .section-title {{
-            color: #2c3e50;
-            border-bottom: 2px solid #007bff;
-            padding-bottom: 10px;
-            margin-bottom: 20px;
-        }}
-        .debit-column {{
-            background-color: #f8f9fa;
-            color: #28a745;
-            font-weight: bold;
-        }}
-        .credit-column {{
-            background-color: #f8f9fa;
-            color: #dc3545;
-            font-weight: bold;
-        }}
+        .btn-submit {{ background: #007bff; color: white; border: none; padding: 12px 30px; font-size: 16px; border-radius: 4px; cursor: pointer; }}
+        .btn-submit:hover {{ background: #0056b3; }}
     </style>
     
-    <div class="opening-balance-form">
-        <h3 class="section-title">📝 Input Neraca Saldo Awal</h3>
-        <p>Masukkan informasi perusahaan dan saldo awal untuk setiap akun.</p>
+    {f'<div style="background:#f8d7da; color:#721c24; padding:15px; border-radius:4px; margin-bottom:15px;">{error_message}</div>' if error_message else ''}
+    {f'<div style="background:#d4edda; color:#155724; padding:15px; border-radius:4px; margin-bottom:15px;">{success_message}</div>' if success_message else ''}
+
+    <form method="POST" action="/admin/opening-balance" onsubmit="return confirm('Simpan Neraca Saldo? Data lama akan digantikan.');">
+        {company_form_html}
         
-        {f'<div style="color: red; font-weight: bold; padding: 10px; background-color: #f8d7da; border-radius: 5px; margin-bottom: 15px;">{error_message}</div>' if error_message else ''}
-        {f'<div style="color: green; font-weight: bold; padding: 10px; background-color: #d4edda; border-radius: 5px; margin-bottom: 15px;">{success_message}</div>' if success_message else ''}
-        
-        <form method="POST" action="/admin/opening-balance" onsubmit="return validateForm()">
-            {company_form}
-            
-            <h3 class="section-title">💰 Input Saldo Awal Akun</h3>
+        <div style="background: white; padding: 20px; border: 1px solid #ddd; border-radius: 5px;">
+            <h3 style="margin-top:0;">📝 Input Saldo Awal</h3>
+            <p style="font-size:0.9em; color:#666;">Masukkan saldo positif. Gunakan fitur kalkulator di bawah akun aset tetap untuk menghitung akumulasi.</p>
             {account_inputs}
             
-            <div style="margin-top: 30px; text-align: center;">
-                <input type="submit" value="💾 Simpan Neraca Saldo Awal" 
-                       class="btn-blue" 
-                       style="padding: 12px 30px; font-size: 16px; background-color: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer;">
-                <button type="button" onclick="resetForm()" 
-                        style="background-color: #6c757d; color: white; padding: 12px 30px; border: none; border-radius: 5px; cursor: pointer; margin-left: 10px;">
-                    🔄 Reset Form
-                </button>
+            <div style="text-align:center; margin-top:30px;">
+                <button type="submit" class="btn-submit">💾 Simpan Perubahan</button>
             </div>
-        </form>
-    </div>
+        </div>
+    </form>
 
-    <!-- ... (bagian saldo display dan sisanya tetap sama) -->
+    {preview_html}
+
+    <script>
+    const mapAkum = {{
+        '1201': '1202', 
+        '1203': '1204', 
+        '1205': '1206'
+    }};
+
+    function formatRupiah(angka) {{
+        return new Intl.NumberFormat('id-ID', {{ style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }}).format(angka);
+    }}
+
+    function hitungPenyusutan(kodeAset) {{
+        const kodeAkum = mapAkum[kodeAset];
+        if(!kodeAkum) return;
+
+        const asetVal = parseFloat(document.getElementById('balance_'+kodeAset).value) || 0;
+        const masa = parseFloat(document.getElementById('masa_'+kodeAset).value) || 0;
+        const pakai = parseFloat(document.getElementById('pakai_'+kodeAset).value) || 0;
+        
+        let akumulasi = 0;
+        let perTahun = 0;
+
+        if(masa > 0) {{
+            perTahun = asetVal / masa;
+            akumulasi = perTahun * pakai;
+        }}
+
+        // Isi Input Akumulasi otomatis
+        const inputAkum = document.getElementById('balance_'+kodeAkum);
+        if(inputAkum) inputAkum.value = Math.round(akumulasi);
+        
+        // Tampilkan Info Text
+        const infoDiv = document.getElementById('info_'+kodeAset);
+        if(infoDiv) {{
+            if(akumulasi > 0) infoDiv.innerHTML = `Penyusutan/Thn: ${{formatRupiah(perTahun)}} | Total Akumulasi: ${{formatRupiah(akumulasi)}} (Auto-filled)`;
+            else infoDiv.innerHTML = "";
+        }}
+    }}
+    </script>
     """
-    
+
     return render_page("Neraca Saldo Awal", body, sidebar_content=get_admin_sidebar_html())
 
 def render_add_account_form(error=None):
@@ -4528,7 +4708,10 @@ def render_add_account_form(error=None):
 # =========================
 @app.route("/admin/delete-transactions", methods=['POST'])
 def delete_transactions():
-    """Memproses penghapusan transaksi yang dipilih."""
+    """
+    Memproses penghapusan transaksi jurnal dan inventory log terkait.
+    Menggunakan deskripsi (Nomor Faktur) sebagai kunci penghapusan log inventory.
+    """
     if session.get('role') != 'admin':
         return redirect(url_for('index'))
         
@@ -4537,7 +4720,30 @@ def delete_transactions():
     
     with db:
         for entry_id in ids_to_delete:
-            db.execute("DELETE FROM journal_entries WHERE id = ?", (entry_id,))
+            # 1. AMBIL DATA JURNAL DULU
+            # Kita hanya perlu deskripsi (yang berisi No. Faktur)
+            journal = db.execute("SELECT description FROM journal_entries WHERE id = ?", (entry_id,)).fetchone()
+            
+            if journal:
+                unique_identifier = journal['description']
+                
+                # CATATAN PENTING:
+                # Logika ini mengasumsikan bahwa:
+                # a) Semua Pembelian/Masuk (purchase) di inventory_log dan journal_entries
+                #    menggunakan Nomor Faktur sebagai unique_identifier/description.
+                # b) Nomor Faktur ini UNIK di seluruh tabel.
+
+                # 2. HAPUS DATA DI INVENTORY LOG
+                # Hapus semua baris di inventory_log yang memiliki deskripsi yang cocok
+                db.execute("DELETE FROM inventory_log WHERE description = ?", (unique_identifier,))
+                
+                # 3. HAPUS DETAIL JURNAL
+                db.execute("DELETE FROM journal_details WHERE entry_id = ?", (entry_id,))
+                
+                # 4. HAPUS HEADER JURNAL
+                db.execute("DELETE FROM journal_entries WHERE id = ?", (entry_id,))
+            
+            # Jika jurnal tidak ditemukan (mungkin sudah terhapus), lanjutkan loop.
 
     return redirect(url_for('transactions_list'))
 
@@ -8779,309 +8985,176 @@ def download_equity_change_excel():
     )
 
 # ==================================
-# LAPORAN NERACA
+# LAPORAN POSISI KEUANGAN
 # ==================================
 @app.route("/admin/financial-position")
 def financial_position():
-    """Laporan Neraca"""
+    """Laporan Neraca dengan Layout Sejajar (Aligned Footer)"""
     if session.get('role') != 'admin':
         return redirect(url_for('index'))
     
     db = get_db()
     
-    # Ambil data perusahaan dan periode dari database
+    # --- 1. SETUP INFO PERUSAHAAN ---
     company_info = db.execute("SELECT * FROM company_info LIMIT 1").fetchone()
-    
-    # Set default jika data perusahaan belum ada
     nama_perusahaan = company_info['company_name'] if company_info else 'Budidaya Gurame'
     periode_akuntansi = company_info['accounting_period'] if company_info else '2025'
     
-    # Parameter periode (opsional)
+    # --- 2. PARAMETER TANGGAL ---
     start_date = request.args.get('start_date', '')
     end_date = request.args.get('end_date', '')
-    
-    try:
-        # AMBIL DATA ASET
-        aset_query = """
-        SELECT 
-            coa.account_code,
-            coa.account_name,
-            coa.account_type,
-            CASE 
-                WHEN coa.account_type IN ('Aset Lancar', 'Aset Tetap') THEN
-                    (COALESCE((
-                        SELECT (SUM(debit) - SUM(credit)) 
-                        FROM journal_details 
-                        WHERE account_code = coa.account_code AND entry_id = 1
-                    ), 0) +
-                    COALESCE(SUM(CASE WHEN je.id != 1 THEN jd.debit ELSE 0 END), 0) -
-                    COALESCE(SUM(CASE WHEN je.id != 1 THEN jd.credit ELSE 0 END), 0))
-                ELSE 0
-            END as saldo
-        FROM chart_of_accounts coa
-        LEFT JOIN journal_details jd ON coa.account_code = jd.account_code
-        LEFT JOIN journal_entries je ON jd.entry_id = je.id
-        WHERE coa.account_type IN ('Aset Lancar', 'Aset Tetap')
-        """
-        
-        aset_params = []
-        if start_date and end_date:
-            aset_query += " AND (je.entry_timestamp BETWEEN ? AND ? OR je.id = 1)"
-            aset_params.extend([f"{start_date} 00:00:00", f"{end_date} 23:59:59"])
-        
-        aset_query += " GROUP BY coa.account_code, coa.account_name, coa.account_type"
-        aset_data = db.execute(aset_query, aset_params).fetchall()
+    cutoff_date = f"{end_date} 23:59:59" if end_date else f"{periode_akuntansi}-12-31 23:59:59"
+    period_text = f"Per {end_date}" if end_date else f"Per 31 Desember {periode_akuntansi}"
+    if start_date and end_date:
+        period_text = f"Periode {start_date} s/d {end_date}"
 
-        # AMBIL DATA LIABILITAS
-        liabilitas_query = """
+    # --- 3. FUNGSI HELPERS ---
+    def get_balance_by_type(account_types):
+        query = f"""
         SELECT 
-            coa.account_code,
-            coa.account_name,
-            coa.account_type,
-            CASE 
-                WHEN coa.account_type = 'Liabilitas' THEN
-                    (COALESCE((
-                        SELECT (SUM(credit) - SUM(debit)) 
-                        FROM journal_details 
-                        WHERE account_code = coa.account_code AND entry_id = 1
-                    ), 0) +
-                    COALESCE(SUM(CASE WHEN je.id != 1 THEN jd.credit ELSE 0 END), 0) -
-                    COALESCE(SUM(CASE WHEN je.id != 1 THEN jd.debit ELSE 0 END), 0))
-                ELSE 0
-            END as saldo
+            coa.account_code, coa.account_name, coa.account_type,
+            COALESCE(SUM(jd.debit), 0) as total_debit,
+            COALESCE(SUM(jd.credit), 0) as total_credit
         FROM chart_of_accounts coa
         LEFT JOIN journal_details jd ON coa.account_code = jd.account_code
         LEFT JOIN journal_entries je ON jd.entry_id = je.id
-        WHERE coa.account_type = 'Liabilitas'
+        WHERE coa.account_type IN ({','.join(['?']*len(account_types))})
+        AND (je.entry_timestamp <= ? OR je.entry_timestamp IS NULL)
+        GROUP BY coa.account_code, coa.account_name, coa.account_type
         """
-        
-        liabilitas_params = []
-        if start_date and end_date:
-            liabilitas_query += " AND (je.entry_timestamp BETWEEN ? AND ? OR je.id = 1)"
-            liabilitas_params.extend([f"{start_date} 00:00:00", f"{end_date} 23:59:59"])
-        
-        liabilitas_query += " GROUP BY coa.account_code, coa.account_name, coa.account_type"
-        liabilitas_data = db.execute(liabilitas_query, liabilitas_params).fetchall()
-        
-        # AMBIL DATA MODAL (Ekuitas)
-        modal_query = """
-        SELECT 
-            coa.account_code,
-            coa.account_name,
-            coa.account_type,
-            CASE 
-                WHEN coa.account_type = 'Ekuitas' THEN
-                    (COALESCE((
-                        SELECT (SUM(credit) - SUM(debit)) 
-                        FROM journal_details 
-                        WHERE account_code = coa.account_code AND entry_id = 1
-                    ), 0) +
-                    COALESCE(SUM(CASE WHEN je.id != 1 THEN jd.credit ELSE 0 END), 0) -
-                    COALESCE(SUM(CASE WHEN je.id != 1 THEN jd.debit ELSE 0 END), 0))
-                ELSE 0
-            END as saldo
-        FROM chart_of_accounts coa
-        LEFT JOIN journal_details jd ON coa.account_code = jd.account_code
-        LEFT JOIN journal_entries je ON jd.entry_id = je.id
-        WHERE coa.account_type = 'Ekuitas'
+        params = account_types + [cutoff_date]
+        return db.execute(query, params).fetchall()
+
+    def get_specific_balance(account_code, is_credit_normal=True):
+        query = """
+        SELECT SUM(jd.debit) as d, SUM(jd.credit) as c
+        FROM journal_details jd
+        JOIN journal_entries je ON jd.entry_id = je.id
+        WHERE jd.account_code = ? AND je.entry_timestamp <= ?
         """
-        
-        modal_params = []
-        if start_date and end_date:
-            modal_query += " AND (je.entry_timestamp BETWEEN ? AND ? OR je.id = 1)"
-            modal_params.extend([f"{start_date} 00:00:00", f"{end_date} 23:59:59"])
-        
-        modal_query += " GROUP BY coa.account_code, coa.account_name, coa.account_type"
-        modal_data = db.execute(modal_query, modal_params).fetchall()
-        
-        # HITUNG TOTAL ASET
+        row = db.execute(query, [account_code, cutoff_date]).fetchone()
+        debit = Decimal(str(row['d'] or 0))
+        credit = Decimal(str(row['c'] or 0))
+        return (credit - debit) if is_credit_normal else (debit - credit)
+
+    def calculate_net_income_upto_date():
+        rev_rows = get_balance_by_type(['Pendapatan'])
+        total_revenue = sum([Decimal(str(r['total_credit'])) - Decimal(str(r['total_debit'])) for r in rev_rows])
+        exp_rows = get_balance_by_type(['Beban'])
+        total_expense = sum([Decimal(str(r['total_debit'])) - Decimal(str(r['total_credit'])) for r in exp_rows])
+        return total_revenue - total_expense
+
+    try:
+        # --- HITUNG ASET ---
+        aset_data = get_balance_by_type(['Aset Lancar', 'Aset Tetap'])
         total_aset_lancar = Decimal('0')
         total_aset_tetap = Decimal('0')
-        
         aset_lancar_html = ""
         aset_tetap_html = ""
-        
-        for aset in aset_data:
-            saldo = Decimal(str(aset['saldo'] or '0'))
-            if aset['account_type'] == 'Aset Lancar' and saldo != 0:
-                total_aset_lancar += saldo
-                aset_lancar_html += f"""
-                <tr>
-                    <td style="padding-left: 30px;">{aset['account_name']}</td>
-                    <td class="currency">{format_currency(saldo)}</td>
-                </tr>
-                """
-            elif aset['account_type'] == 'Aset Tetap' and saldo != 0:
-                total_aset_tetap += saldo
-                aset_tetap_html += f"""
-                <tr>
-                    <td style="padding-left: 30px;">{aset['account_name']}</td>
-                    <td class="currency">{format_currency(saldo)}</td>
-                </tr>
-                """
-        
+
+        for row in aset_data:
+            saldo = Decimal(row['total_debit']) - Decimal(row['total_credit'])
+            if saldo != 0:
+                html_row = f'<tr><td style="padding-left: 30px;">{row["account_name"]}</td><td class="currency">{format_currency(saldo)}</td></tr>'
+                if row['account_type'] == 'Aset Lancar':
+                    total_aset_lancar += saldo
+                    aset_lancar_html += html_row
+                elif row['account_type'] == 'Aset Tetap':
+                    total_aset_tetap += saldo
+                    aset_tetap_html += html_row
         total_aset = total_aset_lancar + total_aset_tetap
-        
-        # HITUNG TOTAL LIABILITAS
+
+        # --- HITUNG LIABILITAS ---
+        liabilitas_data = get_balance_by_type(['Liabilitas'])
         total_liabilitas = Decimal('0')
         liabilitas_html = ""
-        
-        for liabilitas in liabilitas_data:
-            saldo = Decimal(str(liabilitas['saldo'] or '0'))
+        for row in liabilitas_data:
+            saldo = Decimal(row['total_credit']) - Decimal(row['total_debit'])
             if saldo != 0:
                 total_liabilitas += saldo
-                liabilitas_html += f"""
-                <tr>
-                    <td style="padding-left: 30px;">{liabilitas['account_name']}</td>
-                    <td class="currency">{format_currency(saldo)}</td>
-                </tr>
-                """
-        
-        # HITUNG TOTAL MODAL
-        total_modal = Decimal('0')
-        modal_html = ""
-        
-        for modal in modal_data:
-            saldo = Decimal(str(modal['saldo'] or '0'))
-            if saldo != 0:
-                # Untuk akun prive, kurangkan dari modal
-                if 'prive' in modal['account_name'].lower() or 'drawing' in modal['account_name'].lower():
-                    total_modal -= saldo
-                    modal_html += f"""
-                    <tr>
-                        <td style="padding-left: 30px;">{modal['account_name']}</td>
-                        <td class="currency">({format_currency(saldo)})</td>
-                    </tr>
-                    """
-                else:
-                    total_modal += saldo
-                    modal_html += f"""
-                    <tr>
-                        <td style="padding-left: 30px;">{modal['account_name']}</td>
-                        <td class="currency">{format_currency(saldo)}</td>
-                    </tr>
-                    """
-        
-        # HITUNG TOTAL LIABILITAS DAN MODAL
-        total_liabilitas_modal = total_liabilitas + total_modal
-        
-        # Format tanggal untuk judul
-        if start_date and end_date:
-            period_text = f"Periode {start_date} s/d {end_date}"
-        else:
-            period_text = f"Per 31 Desember {periode_akuntansi}"
-            
+                liabilitas_html += f'<tr><td style="padding-left: 30px;">{row["account_name"]}</td><td class="currency">{format_currency(saldo)}</td></tr>'
+
+        # --- HITUNG MODAL AKHIR ---
+        modal_awal_calc = get_specific_balance('3101', is_credit_normal=True) 
+        prive_calc = get_specific_balance('3102', is_credit_normal=False)
+        laba_bersih_calc = calculate_net_income_upto_date()
+        total_modal_akhir = modal_awal_calc + laba_bersih_calc - prive_calc
+
+        modal_html = f"""
+        <tr>
+            <td style="padding-left: 30px;">Modal Akhir</td>
+            <td class="currency">{format_currency(total_modal_akhir)}</td>
+        </tr>
+        """
+        total_liabilitas_modal = total_liabilitas + total_modal_akhir
+
     except Exception as e:
-        error_message = f"❌ Terjadi kesalahan: {str(e)}"
         import traceback
         print("Error details:", traceback.format_exc())
-        
-        # Set default values jika error
-        aset_lancar_html = aset_tetap_html = liabilitas_html = modal_html = ""
-        total_aset_lancar = total_aset_tetap = total_aset = Decimal('0')
-        total_liabilitas = total_modal = total_liabilitas_modal = Decimal('0')
-        period_text = f"Per 31 Desember {periode_akuntansi}"
+        return f"Terjadi kesalahan: {str(e)}", 500
 
-    # BUAT BODY HTML
+    # --- HTML & CSS ---
+    empty_row = '<tr><td colspan="2" style="text-align: center; color: #6c757d;">- 0 -</td></tr>'
+
     body = f"""
     <style>
-        .balance-sheet-container {{
-            max-width: 1000px;
-            margin: 0 auto;
-            padding: 20px;
-            font-family: Arial, sans-serif;
+        .balance-sheet-container {{ max-width: 1100px; margin: 0 auto; padding: 20px; font-family: Arial, sans-serif; }}
+        .company-header {{ text-align: center; margin-bottom: 30px; }}
+        .company-name {{ font-size: 24px; font-weight: bold; margin-bottom: 5px; }}
+        .report-title {{ font-size: 18px; font-weight: bold; margin-bottom: 5px; }}
+        .period {{ font-size: 14px; margin-bottom: 20px; color: #555; }}
+        
+        /* Flex Container untuk 2 Kolom */
+        .balance-columns {{ 
+            display: flex; 
+            gap: 30px; 
+            margin-top: 20px; 
+            align-items: stretch; /* Memastikan kedua kolom tingginya sama */
         }}
-        .company-header {{
-            text-align: center;
-            margin-bottom: 30px;
+        
+        /* Kartu per Kolom (Aset / Pasiva) */
+        .balance-section {{ 
+            flex: 1; 
+            min-width: 300px; 
+            display: flex;       /* Nested Flexbox */
+            flex-direction: column; /* Susun ke bawah */
+            border: 1px solid #ddd;
+            padding: 15px;
+            background-color: #fff;
         }}
-        .company-name {{
-            font-size: 24px;
-            font-weight: bold;
-            margin-bottom: 5px;
+
+        .balance-sheet-table {{ width: 100%; border-collapse: collapse; margin-bottom: 10px; }}
+        .balance-sheet-table th, .balance-sheet-table td {{ padding: 8px 12px; border: 1px solid #ddd; }}
+        .section-header {{ background-color: #f1f1f1; font-weight: bold; text-align: left; }}
+        .total-row {{ background-color: #f8f9fa; font-weight: bold; border-top: 2px solid #333; }}
+        .currency {{ text-align: right; font-family: 'Courier New', monospace; }}
+
+        /* Bagian Total Paling Bawah (Sticky Bottom) */
+        .grand-total-container {{
+            margin-top: auto; /* Ini kuncinya: dorong ke paling bawah */
+            padding-top: 15px;
         }}
-        .report-title {{
-            font-size: 18px;
-            font-weight: bold;
-            margin-bottom: 5px;
-        }}
-        .period {{
-            font-size: 14px;
-            margin-bottom: 20px;
-        }}
-        .balance-sheet-table {{
+        .grand-total-table {{
             width: 100%;
             border-collapse: collapse;
-            margin: 20px 0;
-        }}
-        .balance-sheet-table th, .balance-sheet-table td {{
-            padding: 8px 12px;
-            border: 1px solid #ddd;
-        }}
-        .balance-sheet-table th {{
-            background-color: #f2f2f2;
-            font-weight: bold;
-        }}
-        .section-header {{
-            background-color: #e9ecef;
-            font-weight: bold;
-        }}
-        .total-row {{
-            background-color: #f8f9fa;
-            font-weight: bold;
-            border-top: 2px solid #333;
-        }}
-        .grand-total {{
-            background-color: #e0e0e0;
-            font-weight: bold;
-            font-size: 1.1em;
+            background-color: #e2e6ea;
             border-top: 3px solid #333;
         }}
-        .currency {{
-            text-align: right;
-            font-family: 'Courier New', Courier;
+        .grand-total-table td {{
+            padding: 12px;
+            font-weight: bold;
+            font-size: 1.1em;
         }}
-        .balance-columns {{
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 30px;
-            margin-top: 30px;
-        }}
-        .balance-section {{
-            background-color: #f8f9fa;
-            padding: 20px;
-            border-radius: 8px;
-            border: 1px solid #dee2e6;
-        }}
-        .print-button {{
-            text-align: center;
-            margin-top: 30px;
-        }}
-        .filter-form {{
-            background-color: #f8f9fa;
-            padding: 15px;
-            border-radius: 5px;
-            margin-bottom: 20px;
-        }}
-        .download-section {{
-            text-align: right;
-            margin-bottom: 20px;
-        }}
-        .company-info {{
-            margin-top: 30px;
-            padding: 15px;
-            background-color: #f8f9fa;
-            border-radius: 5px;
-            font-size: 14px;
-        }}
+
+        .download-btn {{ display: inline-block; background-color: #28a745; color: white; padding: 8px 15px; text-decoration: none; border-radius: 4px; margin-bottom: 10px; font-size: 14px; }}
+        .status-box {{ margin-top: 30px; text-align: center; padding: 15px; border-radius: 8px; border: 1px solid #ddd; }}
+        .status-balanced {{ background-color: #d4edda; color: #155724; border-color: #c3e6cb; }}
+        .status-unbalanced {{ background-color: #f8d7da; color: #721c24; border-color: #f5c6cb; }}
     </style>
 
     <div class="balance-sheet-container">
-        <!-- TOMBOL DOWNLOAD -->
-        <div class="download-section">
-            <a href="{url_for('download_financial_reports_all')}" style="text-decoration: none;">
-                <input type="button" value="📥 Download Excel" class="btn-blue" style="background-color: #28a745; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer;">
-            </a>
+        <div style="text-align: right;">
+            <a href="{url_for('download_financial_position_excel', end_date=end_date)}" class="download-btn">📥 Download Excel</a>
         </div>
 
         <div class="company-header">
@@ -9091,232 +9164,313 @@ def financial_position():
         </div>
 
         <div class="balance-columns">
-            <!-- Kolom ASET -->
             <div class="balance-section">
-                <h3 style="color: #2c3e50; border-bottom: 2px solid #28a745; padding-bottom: 10px; margin-bottom: 20px;">ASET</h3>
-                
-                <table class="balance-sheet-table">
-                    <!-- Aset Lancar -->
-                    <tr class="section-header">
-                        <th colspan="2">Aset Lancar</th>
-                    </tr>
-                    {aset_lancar_html if aset_lancar_html else '<tr><td colspan="2" style="text-align: center; color: #6c757d;">Tidak ada data</td></tr>'}
-                    <tr class="total-row">
-                        <td><strong>Total Aset Lancar</strong></td>
-                        <td class="currency"><strong>{format_currency(total_aset_lancar)}</strong></td>
-                    </tr>
-                    
-                    <!-- Aset Tetap -->
-                    <tr class="section-header">
-                        <th colspan="2">Aset Tetap</th>
-                    </tr>
-                    {aset_tetap_html if aset_tetap_html else '<tr><td colspan="2" style="text-align: center; color: #6c757d;">Tidak ada data</td></tr>'}
-                    <tr class="total-row">
-                        <td><strong>Total Aset Tetap</strong></td>
-                        <td class="currency"><strong>{format_currency(total_aset_tetap)}</strong></td>
-                    </tr>
-                    
-                    <!-- Total Aset -->
-                    <tr class="grand-total">
-                        <td><strong>TOTAL ASET</strong></td>
-                        <td class="currency"><strong>{format_currency(total_aset)}</strong></td>
-                    </tr>
-                </table>
+                <div> <h3 style="color: #2c3e50; border-bottom: 2px solid #28a745; padding-bottom: 10px;">ASET</h3>
+                    <table class="balance-sheet-table">
+                        <tr class="section-header"><th colspan="2">Aset Lancar</th></tr>
+                        {aset_lancar_html if aset_lancar_html else empty_row}
+                        <tr class="total-row">
+                            <td>Total Aset Lancar</td>
+                            <td class="currency">{format_currency(total_aset_lancar)}</td>
+                        </tr>
+                        
+                        <tr class="section-header"><th colspan="2">Aset Tetap</th></tr>
+                        {aset_tetap_html if aset_tetap_html else empty_row}
+                        <tr class="total-row">
+                            <td>Total Aset Tetap</td>
+                            <td class="currency">{format_currency(total_aset_tetap)}</td>
+                        </tr>
+                    </table>
+                </div>
+
+                <div class="grand-total-container">
+                    <table class="grand-total-table">
+                        <tr>
+                            <td>TOTAL ASET</td>
+                            <td class="currency">{format_currency(total_aset)}</td>
+                        </tr>
+                    </table>
+                </div>
             </div>
 
-            <!-- Kolom LIABILITAS & MODAL -->
             <div class="balance-section">
-                <h3 style="color: #2c3e50; border-bottom: 2px solid #dc3545; padding-bottom: 10px; margin-bottom: 20px;">LIABILITAS & MODAL</h3>
-                
-                <table class="balance-sheet-table">
-                    <!-- Liabilitas -->
-                    <tr class="section-header">
-                        <th colspan="2">Liabilitas</th>
-                    </tr>
-                    {liabilitas_html if liabilitas_html else '<tr><td colspan="2" style="text-align: center; color: #6c757d;">Tidak ada data</td></tr>'}
-                    <tr class="total-row">
-                        <td><strong>Total Liabilitas</strong></td>
-                        <td class="currency"><strong>{format_currency(total_liabilitas)}</strong></td>
-                    </tr>
-                    
-                    <!-- Modal -->
-                    <tr class="section-header">
-                        <th colspan="2">Modal</th>
-                    </tr>
-                    {modal_html if modal_html else '<tr><td colspan="2" style="text-align: center; color: #6c757d;">Tidak ada data</td></tr>'}
-                    <tr class="total-row">
-                        <td><strong>Total Modal</strong></td>
-                        <td class="currency"><strong>{format_currency(total_modal)}</strong></td>
-                    </tr>
-                    
-                    <!-- Total Liabilitas & Modal -->
-                    <tr class="grand-total">
-                        <td><strong>TOTAL LIABILITAS & MODAL</strong></td>
-                        <td class="currency"><strong>{format_currency(total_liabilitas_modal)}</strong></td>
-                    </tr>
-                </table>
+                <div> <h3 style="color: #2c3e50; border-bottom: 2px solid #dc3545; padding-bottom: 10px;">LIABILITAS & EKUITAS</h3>
+                    <table class="balance-sheet-table">
+                        <tr class="section-header"><th colspan="2">Liabilitas</th></tr>
+                        {liabilitas_html if liabilitas_html else empty_row}
+                        <tr class="total-row">
+                            <td>Total Liabilitas</td>
+                            <td class="currency">{format_currency(total_liabilitas)}</td>
+                        </tr>
+
+                        <tr class="section-header"><th colspan="2">Ekuitas</th></tr>
+                        {modal_html} 
+                        <tr class="total-row">
+                            <td>Total Ekuitas</td>
+                            <td class="currency">{format_currency(total_modal_akhir)}</td>
+                        </tr>
+                    </table>
+                </div>
+
+                <div class="grand-total-container">
+                    <table class="grand-total-table">
+                        <tr>
+                            <td>TOTAL LIABILITAS & EKUITAS</td>
+                            <td class="currency">{format_currency(total_liabilitas_modal)}</td>
+                        </tr>
+                    </table>
+                </div>
             </div>
         </div>
 
-        <!-- Status Balance -->
-        <div style="margin-top: 30px; text-align: center; padding: 20px; background-color: {'#d4edda' if total_aset == total_liabilitas_modal else '#f8d7da'}; border-radius: 8px;">
-            <h4 style="color: {'#155724' if total_aset == total_liabilitas_modal else '#721c24'};">
-                {'✅ NERACA SEIMBANG' if total_aset == total_liabilitas_modal else '❌ NERACA TIDAK SEIMBANG'}
-            </h4>
-            <p style="color: {'#155724' if total_aset == total_liabilitas_modal else '#721c24'}; margin: 0;">
-                Total Aset: {format_currency(total_aset)} | Total Liabilitas & Modal: {format_currency(total_liabilitas_modal)}
-                {' | Selisih: ' + format_currency(abs(total_aset - total_liabilitas_modal)) if total_aset != total_liabilitas_modal else ''}
-            </p>
-        </div>
+        <div class="status-box {'status-balanced' if total_aset == total_liabilitas_modal else 'status-unbalanced'}">
     </div>
     """
     
     return render_page("Laporan Posisi Keuangan", body, sidebar_content=get_admin_sidebar_html())
 
-@app.route("/admin/download/financial-reports-excel")
-def download_financial_reports_all():
-    """Membuat dan mengirim file .xlsx dari semua laporan keuangan"""
+@app.route("/admin/download/financial-position-excel")
+def download_financial_position_excel():
+    """Membuat dan mengirim file .xlsx dari Laporan Posisi Keuangan (Neraca)"""
     if session.get('role') != 'admin':
         return redirect(url_for('index'))
         
     db = get_db()
     
-    # Buat Workbook Excel dengan multiple sheets
-    wb = Workbook()
+    # --- AMBIL PARAMETER TANGGAL ---
+    end_date = request.args.get('end_date', '')
     
-    # === SHEET 1: LAPORAN LABA RUGI ===
-    ws_income = wb.active
-    ws_income.title = "Laporan Laba Rugi"
+    # --- SETUP INFO PERUSAHAAN ---
+    company_info = db.execute("SELECT * FROM company_info LIMIT 1").fetchone()
+    nama_perusahaan = company_info['company_name'] if company_info else 'Budidaya Gurame'
+    periode_akuntansi = company_info['accounting_period'] if company_info else '2025'
     
-    # Header Laporan Laba Rugi
-    ws_income.append(["LAPORAN LABA RUGI"])
-    ws_income.append(["PT Gurame"])
-    ws_income.append([f"Periode: {datetime.now().strftime('%d-%m-%Y')}"])
-    ws_income.append([])
-    
-    # Ambil data pendapatan dan beban
-    income_data = db.execute("""
-        SELECT 
-            coa.account_name,
-            SUM(jd.credit) - SUM(jd.debit) as amount
-        FROM journal_details jd
-        JOIN chart_of_accounts coa ON jd.account_code = coa.account_code
-        WHERE coa.account_type = 'Pendapatan'
-        GROUP BY coa.account_code, coa.account_name
-        HAVING amount != 0
-    """).fetchall()
-    
-    expense_data = db.execute("""
-        SELECT 
-            coa.account_name,
-            SUM(jd.debit) - SUM(jd.credit) as amount
-        FROM journal_details jd
-        JOIN chart_of_accounts coa ON jd.account_code = coa.account_code
-        WHERE coa.account_type = 'Beban'
-        GROUP BY coa.account_code, coa.account_name
-        HAVING amount != 0
-    """).fetchall()
-    
-    # Tulis data pendapatan
-    ws_income.append(["PENDAPATAN:"])
-    total_pendapatan = 0
-    for item in income_data:
-        amount = float(item['amount'] or 0)
-        total_pendapatan += amount
-        ws_income.append([f"  {item['account_name']}", "", amount])
-    
-    ws_income.append(["Total Pendapatan", "", total_pendapatan])
-    ws_income.append([])
-    
-    # Tulis data beban
-    ws_income.append(["BEBAN:"])
-    total_beban = 0
-    for item in expense_data:
-        amount = float(item['amount'] or 0)
-        total_beban += amount
-        ws_income.append([f"  {item['account_name']}", "", amount])
-    
-    ws_income.append(["Total Beban", "", total_beban])
-    ws_income.append([])
-    
-    # Hitung laba/rugi bersih
-    laba_rugi_bersih = total_pendapatan - total_beban
-    ws_income.append(["LABA/RUGI BERSIH", "", laba_rugi_bersih])
-    
-    # === SHEET 2: NERACA ===
-    ws_balance = wb.create_sheet("Neraca")
-    
-    ws_balance.append(["LAPORAN POSISI KEUANGAN (NERACA)"])
-    ws_balance.append(["Perusahaan "])
-    ws_balance.append([f"Periode: {datetime.now().strftime('%d-%m-%Y')}"])
-    ws_balance.append([])
-    
-    # Aset
-    ws_balance.append(["ASET"])
-    asset_data = db.execute("""
-        SELECT 
-            coa.account_name,
-            SUM(jd.debit) - SUM(jd.credit) as amount
-        FROM journal_details jd
-        JOIN chart_of_accounts coa ON jd.account_code = coa.account_code
-        WHERE coa.account_type IN ('Aset Lancar', 'Aset Tetap')
-        GROUP BY coa.account_code, coa.account_name
-        HAVING amount != 0
-    """).fetchall()
-    
-    total_aset = 0
-    for item in asset_data:
-        amount = float(item['amount'] or 0)
-        total_aset += amount
-        ws_balance.append([f"  {item['account_name']}", amount])
-    
-    ws_balance.append(["Total Aset", total_aset])
-    ws_balance.append([])
-    
-    # Kewajiban & Ekuitas
-    ws_balance.append(["KEWAJIBAN DAN EKUITAS"])
-    liability_equity_data = db.execute("""
-        SELECT 
-            coa.account_name,
-            SUM(jd.credit) - SUM(jd.debit) as amount
-        FROM journal_details jd
-        JOIN chart_of_accounts coa ON jd.account_code = coa.account_code
-        WHERE coa.account_type IN ('Liabilitas', 'Ekuitas')
-        GROUP BY coa.account_code, coa.account_name
-        HAVING amount != 0
-    """).fetchall()
-    
-    total_liability_equity = 0
-    for item in liability_equity_data:
-        amount = float(item['amount'] or 0)
-        total_liability_equity += amount
-        ws_balance.append([f"  {item['account_name']}", amount])
-    
-    ws_balance.append(["Total Kewajiban & Ekuitas", total_liability_equity])
-    
-    # Format semua sheet
-    for ws in [ws_income, ws_balance]:
-        # Format header
-        for row in range(1, 4):
-            for cell in ws[row]:
-                cell.font = openpyxl.styles.Font(bold=True, size=12)
-        
-        # Format angka
-        for row in ws.iter_rows(min_row=5):
-            for cell in row:
-                if cell.column == 3:  # Kolom jumlah
-                    cell.number_format = '"Rp"#,##0.00'
-    
-    # Simpan ke buffer memori
-    mem_file = BytesIO()
-    wb.save(mem_file)
-    mem_file.seek(0)
+    # --- LOGIC CUTOFF DATE ---
+    cutoff_date = f"{end_date} 23:59:59" if end_date else f"{periode_akuntansi}-12-31 23:59:59"
+    period_text = f"Per {end_date}" if end_date else f"Per 31 Desember {periode_akuntansi}"
 
-    return Response(
-        mem_file.getvalue(),
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-disposition": "attachment; filename=laporan_keuangan.xlsx"}
-    )
+    # --- FUNGSI HELPERS (SAMA DENGAN YANG DI ATAS) ---
+    def get_balance_by_type(account_types):
+        query = f"""
+        SELECT 
+            coa.account_code, coa.account_name, coa.account_type,
+            COALESCE(SUM(jd.debit), 0) as total_debit,
+            COALESCE(SUM(jd.credit), 0) as total_credit
+        FROM chart_of_accounts coa
+        LEFT JOIN journal_details jd ON coa.account_code = jd.account_code
+        LEFT JOIN journal_entries je ON jd.entry_id = je.id
+        WHERE coa.account_type IN ({','.join(['?']*len(account_types))})
+        AND (je.entry_timestamp <= ? OR je.entry_timestamp IS NULL)
+        GROUP BY coa.account_code, coa.account_name, coa.account_type
+        """
+        params = account_types + [cutoff_date]
+        return db.execute(query, params).fetchall()
+
+    def get_specific_balance(account_code, is_credit_normal=True):
+        query = """
+        SELECT SUM(jd.debit) as d, SUM(jd.credit) as c
+        FROM journal_details jd
+        JOIN journal_entries je ON jd.entry_id = je.id
+        WHERE jd.account_code = ? AND je.entry_timestamp <= ?
+        """
+        row = db.execute(query, [account_code, cutoff_date]).fetchone()
+        debit = Decimal(str(row['d'] or 0))
+        credit = Decimal(str(row['c'] or 0))
+        return (credit - debit) if is_credit_normal else (debit - credit)
+
+    def calculate_net_income_upto_date():
+        rev_rows = get_balance_by_type(['Pendapatan'])
+        total_revenue = sum([Decimal(str(r['total_credit'])) - Decimal(str(r['total_debit'])) for r in rev_rows])
+        exp_rows = get_balance_by_type(['Beban'])
+        total_expense = sum([Decimal(str(r['total_debit'])) - Decimal(str(r['total_credit'])) for r in exp_rows])
+        return total_revenue - total_expense
+
+    try:
+        # --- HITUNG ASET ---
+        aset_data = get_balance_by_type(['Aset Lancar', 'Aset Tetap'])
+        total_aset_lancar = Decimal('0')
+        total_aset_tetap = Decimal('0')
+        
+        aset_lancar_items = []
+        aset_tetap_items = []
+        
+        for row in aset_data:
+            saldo = Decimal(row['total_debit']) - Decimal(row['total_credit'])
+            if saldo != 0:
+                if row['account_type'] == 'Aset Lancar':
+                    total_aset_lancar += saldo
+                    aset_lancar_items.append({
+                        'nama': row['account_name'],
+                        'saldo': saldo
+                    })
+                elif row['account_type'] == 'Aset Tetap':
+                    total_aset_tetap += saldo
+                    aset_tetap_items.append({
+                        'nama': row['account_name'],
+                        'saldo': saldo
+                    })
+        
+        total_aset = total_aset_lancar + total_aset_tetap
+
+        # --- HITUNG LIABILITAS ---
+        liabilitas_data = get_balance_by_type(['Liabilitas'])
+        total_liabilitas = Decimal('0')
+        liabilitas_items = []
+        
+        for row in liabilitas_data:
+            saldo = Decimal(row['total_credit']) - Decimal(row['total_debit'])
+            if saldo != 0:
+                total_liabilitas += saldo
+                liabilitas_items.append({
+                    'nama': row['account_name'],
+                    'saldo': saldo
+                })
+
+        # --- HITUNG MODAL AKHIR ---
+        modal_awal_calc = get_specific_balance('3101', is_credit_normal=True) 
+        prive_calc = get_specific_balance('3102', is_credit_normal=False)
+        laba_bersih_calc = calculate_net_income_upto_date()
+        total_modal_akhir = modal_awal_calc + laba_bersih_calc - prive_calc
+
+        total_liabilitas_modal = total_liabilitas + total_modal_akhir
+
+        # --- BUAT WORKBOOK EXCEL ---
+        wb = Workbook()
+        ws = wb.active
+        ws.title = " Laporan Posisi Keuangan"
+        
+        # --- HEADER ---
+        ws.append([nama_perusahaan])
+        ws.append(["Laporan Posisi Keuangan"])
+        ws.append([period_text])
+        ws.append([])  # Baris kosong
+        
+        # --- FORMAT HEADER ---
+        for row in range(1, 4):
+            ws.cell(row=row, column=1).font = openpyxl.styles.Font(bold=True, size=14 if row == 1 else 12)
+            ws.cell(row=row, column=1).alignment = openpyxl.styles.Alignment(horizontal='center')
+        
+        # --- ASET (KOLOM KIRI) ---
+        current_row = 5
+        
+        # Header Aset
+        ws.cell(row=current_row, column=1, value="ASET").font = openpyxl.styles.Font(bold=True, size=12)
+        current_row += 1
+        
+        # Aset Lancar
+        ws.cell(row=current_row, column=1, value="Aset Lancar").font = openpyxl.styles.Font(bold=True)
+        current_row += 1
+        
+        for item in aset_lancar_items:
+            ws.cell(row=current_row, column=1, value=item['nama'])
+            ws.cell(row=current_row, column=2, value=float(item['saldo']))
+            current_row += 1
+            
+        if not aset_lancar_items:
+            ws.cell(row=current_row, column=1, value="- 0 -")
+            current_row += 1
+            
+        # Total Aset Lancar
+        ws.cell(row=current_row, column=1, value="Total Aset Lancar").font = openpyxl.styles.Font(bold=True)
+        ws.cell(row=current_row, column=2, value=float(total_aset_lancar)).font = openpyxl.styles.Font(bold=True)
+        current_row += 2
+        
+        # Aset Tetap
+        ws.cell(row=current_row, column=1, value="Aset Tetap").font = openpyxl.styles.Font(bold=True)
+        current_row += 1
+        
+        for item in aset_tetap_items:
+            ws.cell(row=current_row, column=1, value=item['nama'])
+            ws.cell(row=current_row, column=2, value=float(item['saldo']))
+            current_row += 1
+            
+        if not aset_tetap_items:
+            ws.cell(row=current_row, column=1, value="- 0 -")
+            current_row += 1
+            
+        # Total Aset Tetap
+        ws.cell(row=current_row, column=1, value="Total Aset Tetap").font = openpyxl.styles.Font(bold=True)
+        ws.cell(row=current_row, column=2, value=float(total_aset_tetap)).font = openpyxl.styles.Font(bold=True)
+        current_row += 2
+        
+        # Total Aset
+        ws.cell(row=current_row, column=1, value="TOTAL ASET").font = openpyxl.styles.Font(bold=True, size=12)
+        ws.cell(row=current_row, column=2, value=float(total_aset)).font = openpyxl.styles.Font(bold=True, size=12)
+        
+        # --- LIABILITAS & EKUITAS (KOLOM KANAN) ---
+        current_row = 5
+        
+        # Header Liabilitas & Ekuitas
+        ws.cell(row=current_row, column=4, value="LIABILITAS & EKUITAS").font = openpyxl.styles.Font(bold=True, size=12)
+        current_row += 1
+        
+        # Liabilitas
+        ws.cell(row=current_row, column=4, value="Liabilitas").font = openpyxl.styles.Font(bold=True)
+        current_row += 1
+        
+        for item in liabilitas_items:
+            ws.cell(row=current_row, column=4, value=item['nama'])
+            ws.cell(row=current_row, column=5, value=float(item['saldo']))
+            current_row += 1
+            
+        if not liabilitas_items:
+            ws.cell(row=current_row, column=4, value="- 0 -")
+            current_row += 1
+            
+        # Total Liabilitas
+        ws.cell(row=current_row, column=4, value="Total Liabilitas").font = openpyxl.styles.Font(bold=True)
+        ws.cell(row=current_row, column=5, value=float(total_liabilitas)).font = openpyxl.styles.Font(bold=True)
+        current_row += 2
+        
+        # Ekuitas
+        ws.cell(row=current_row, column=4, value="Ekuitas").font = openpyxl.styles.Font(bold=True)
+        current_row += 1
+        
+        # Modal Akhir
+        ws.cell(row=current_row, column=4, value="Modal Akhir")
+        ws.cell(row=current_row, column=5, value=float(total_modal_akhir))
+        current_row += 1
+        
+        # Total Ekuitas
+        ws.cell(row=current_row, column=4, value="Total Ekuitas").font = openpyxl.styles.Font(bold=True)
+        ws.cell(row=current_row, column=5, value=float(total_modal_akhir)).font = openpyxl.styles.Font(bold=True)
+        current_row += 2
+        
+        # Total Liabilitas & Ekuitas
+        ws.cell(row=current_row, column=4, value="TOTAL LIABILITAS & EKUITAS").font = openpyxl.styles.Font(bold=True, size=12)
+        ws.cell(row=current_row, column=5, value=float(total_liabilitas_modal)).font = openpyxl.styles.Font(bold=True, size=12)
+        
+        # --- FORMAT ANGKA ---
+        for col in [2, 5]:  # Kolom jumlah (B dan E)
+            for row in range(1, ws.max_row + 1):
+                cell = ws.cell(row=row, column=col)
+                if isinstance(cell.value, (int, float)):
+                    cell.number_format = '"Rp"#,##0.00;("Rp"#,##0.00)'
+        
+        # --- ATUR LEBAR KOLOM ---
+        ws.column_dimensions['A'].width = 30
+        ws.column_dimensions['B'].width = 20
+        ws.column_dimensions['C'].width = 10  # Spacer
+        ws.column_dimensions['D'].width = 30
+        ws.column_dimensions['E'].width = 20
+        
+        # --- SIMPAN KE BUFFER ---
+        mem_file = BytesIO()
+        wb.save(mem_file)
+        mem_file.seek(0)
+
+        # --- KIRIM SEBAGAI FILE DOWNLOAD ---
+        filename = f"Laporan Posisi Keuangan_{end_date.replace('-', '') if end_date else periode_akuntansi}.xlsx"
+        return Response(
+            mem_file.getvalue(),
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-disposition": f"attachment; filename={filename}"}
+        )
+
+    except Exception as e:
+        import traceback
+        print("Error details:", traceback.format_exc())
+        return f"Terjadi kesalahan: {str(e)}", 500
 
 # ==================================
 # LAPORAN JURNAL PENUTUP
@@ -9403,8 +9557,7 @@ def closing_entries():
             
         body += """
         <hr>
-        <p style="color: red; font-weight: bold;">PERINGATAN: Aksi ini tidak dapat dibatalkan. 
-        Ini akan membuat 3-4 entri jurnal baru untuk menutup akun nominal Anda.</p>
+        <p style="color: red; font-weight: bold;">PERINGATAN: Aksi ini akan membuat 3-4 entri jurnal baru untuk menutup akun nominal Anda.</p>
         <form action="/admin/closing-entries" method="POST">
             <input type="submit" value="Buat Jurnal Penutup Sekarang" class="btn-red" 
                    onclick="return confirm('Anda yakin ingin membuat Jurnal Penutup?');">
@@ -9965,6 +10118,5 @@ def approve_payment(order_id):
 
 # --- Menjalankan Aplikasi ---
 if __name__ == '__main__':
-    
     init_db() 
     app.run(debug=True)
