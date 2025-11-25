@@ -218,7 +218,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS online_payments (
                 order_id TEXT PRIMARY KEY,
                 amount REAL NOT NULL,
-                status TEXT DEFAULT 'pending',
+                status TEXT DEFAULT 'pending','verified', 'rejected'
                 proof_image TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 item_id INTEGER,
@@ -253,7 +253,7 @@ def init_db():
                 ('1206', 'Akumulasi Penyusutan Bangunan', 'Aset Tetap'), 
                 ('1301', 'Tanah', 'Aset Tetap'),
                 # Liabilitas
-                ('2101', 'Hutang Dagang', 'Liabilitas'), 
+                ('2101', 'Utang Dagang', 'Liabilitas'), 
                 # Ekuitas
                 ('3101', 'Modal', 'Ekuitas'), 
                 ('3102', 'Prive', 'Ekuitas'), 
@@ -3566,25 +3566,25 @@ def consumer_shop():
 
 @app.route("/purchase", methods=['POST'])
 def purchase():
-    # 1. Cek Hak Akses
+    #1. Cek Hak Akses
     if session.get('role') != 'consumer':
         return redirect(url_for('index'))
 
     db = get_db()
     
-    # 2. Ambil Data dari Form
+    #2. Ambil Data dari Form
     item_id = request.form.get('item_id')
     qty_str = request.form.get('qty')
     payment_method = request.form.get('payment_method')
     username = session.get('username')
     
-    # Validasi Input Kosong
+    #Validasi Input Kosong
     if not item_id or not qty_str:
         return redirect(url_for('consumer_shop', error="Data tidak lengkap."))
         
     qty = float(qty_str)
     
-    # 3. Validasi Item & Stok
+     #3. Validasi Item & Stok
     item = db.execute("SELECT * FROM inventory_items WHERE id = ?", (item_id,)).fetchone()
     
     # [PENYESUAIAN] Jika item salah, kembali ke SHOP (bukan home)
@@ -3605,7 +3605,7 @@ def purchase():
     if payment_method in ['cash', 'credit']:
         success = record_sale_transaction(db, item, qty, username, payment_method, total_price)
         if success:
-            # [PENYESUAIAN] Redirect ke DASHBOARD (home) dengan pesan sukses
+            #[PENYESUAIAN] Redirect ke DASHBOARD (home) dengan pesan sukses
             return redirect(url_for('consumer_home', success="Pembelian berhasil! Data transaksi telah diperbarui."))
     
     # Jika gagal
@@ -9982,7 +9982,7 @@ def purchase_manual_qris():
             <div class="qris-scan-text">Scan QRIS DANA di bawah ini:</div>
             
             <div class="qris-img-container">
-                <img src="/static/qris_dana.png" class="qris-img" alt="QRIS Code">
+                <img src="/static/qris.jpeg" class="qris-img" alt="QRIS Code">
             </div>
             
             <div class="qris-manual-text">Atau transfer manual ke DANA: <b>0822-4191-5050</b></div>
@@ -10005,8 +10005,18 @@ def verify_payments():
     if session.get('role') != 'admin': return redirect(url_for('index'))
     
     db = get_db()
-    # Query sudah DESC (Descending), artinya yang terbaru ada di urutan pertama
+    # Query transaksi pending
     payments = db.execute("SELECT * FROM online_payments WHERE status = 'pending' ORDER BY created_at DESC").fetchall()
+    
+    # Pesan Notifikasi
+    success_msg = request.args.get('success')
+    error_msg = request.args.get('error')
+    
+    alert_html = ""
+    if success_msg:
+        alert_html = f'<div style="background:#d4edda; color:#155724; padding:10px; border-radius:5px; margin-bottom:15px;">{success_msg}</div>'
+    if error_msg:
+        alert_html = f'<div style="background:#f8d7da; color:#721c24; padding:10px; border-radius:5px; margin-bottom:15px;">{error_msg}</div>'
     
     rows = ""
     for i, p in enumerate(payments, start=1):
@@ -10017,35 +10027,52 @@ def verify_payments():
             <td>{p['buyer_name']}</td>
             <td style="font-weight: bold; color: green;">{format_currency(p['amount'])}</td>
             <td style="text-align: center;">
-                <form action="/admin/approve-payment/{p['order_id']}" method="POST">
-                    <input type="submit" value="✅ Saldo Masuk (Terima)" class="btn-kotak" 
-                           onclick="return confirm('Pastikan saldo sudah masuk di E-Wallet Anda. Lanjutkan?');">
-                </form>
+                <div style="display: flex; gap: 5px; justify-content: center;">
+                    <form action="/admin/approve-payment/{p['order_id']}" method="POST">
+                        <input type="submit" value="✅ Terima" class="btn-kotak" 
+                            onclick="return confirm('Pastikan saldo sudah masuk. Terima pembayaran ini?');">
+                    </form>
+
+                    <form action="/admin/reject-payment/{p['order_id']}" method="POST">
+                        <input type="submit" value="❌ Tolak" class="btn-kotak-red" 
+                            onclick="return confirm('Yakin ingin menolak? Status akan menjadi Gagal di sisi konsumen.');">
+                    </form>
+                </div>
             </td>
         </tr>
         """
         
     body = f"""
     <style>
-        /* --- STYLE TOMBOL KOTAK HIJAU (DIPAKSA !important) --- */
+        /* --- STYLE TOMBOL HIJAU (TERIMA) --- */
         .btn-kotak {{
-            background-color: #28a745 !important; /* HIJAU (Success Color) */
+            background-color: #28a745 !important; 
             color: white !important;
             padding: 8px 15px !important;
             font-weight: bold !important;
-            font-size: 0.9em !important;
+            font-size: 0.85em !important;
             border: none !important;
-            border-radius: 4px !important; /* KOTAK (sedikit tumpul di ujung) */
+            border-radius: 4px !important;
             cursor: pointer !important;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1) !important;
             transition: background-color 0.2s !important;
         }}
-        
-        .btn-kotak:hover {{
-            background-color: #218838 !important; /* Hijau lebih gelap saat disentuh */
-        }}
-        /* -------------------------------- */
+        .btn-kotak:hover {{ background-color: #218838 !important; }}
 
+        /* --- STYLE TOMBOL MERAH (TOLAK) --- */
+        .btn-kotak-red {{
+            background-color: #dc3545 !important; 
+            color: white !important;
+            padding: 8px 15px !important;
+            font-weight: bold !important;
+            font-size: 0.85em !important;
+            border: none !important;
+            border-radius: 4px !important;
+            cursor: pointer !important;
+            transition: background-color 0.2s !important;
+        }}
+        .btn-kotak-red:hover {{ background-color: #c82333 !important; }}
+
+        /* Tabel Style */
         .table-journal {{
             width: 100%;
             border-collapse: collapse;
@@ -10053,8 +10080,6 @@ def verify_payments():
             background: white;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }}
-        
-        /* Header Tabel Abu-abu */
         .table-journal th {{
             background-color: #e9ecef !important;
             color: black !important;
@@ -10063,7 +10088,6 @@ def verify_payments():
             text-align: center;
             font-weight: bold;
         }}
-        
         .table-journal td {{
             padding: 10px;
             border: 1px solid #ddd;
@@ -10072,10 +10096,14 @@ def verify_payments():
     </style>
 
     <h3>Verifikasi Pembayaran QRIS</h3>
+    
+    {alert_html}
+
     <div style="background-color: #e7f3ff; padding: 15px; border-left: 4px solid #007bff; margin-bottom: 20px;">
         <strong>Panduan Admin:</strong><br>
-        Cek aplikasi DANA/E-Wallet Anda. Jika ada uang masuk sesuai nominal dan nama pembeli di bawah, silakan klik tombol <b>Terima</b>.<br>
-        Pemegang E-Wallet DANA: Syifaurrahmah, <strong>0822-4191-5050.</strong><br>
+        Cek aplikasi DANA/E-Wallet Anda. <br>
+        - Klik <b>Terima</b> jika uang sudah masuk.<br>
+        - Klik <b>Tolak</b> jika bukti palsu atau uang belum masuk.
     </div>
     
     <table class="table-journal"> 
@@ -10085,7 +10113,7 @@ def verify_payments():
                 <th>Tanggal</th>
                 <th>Pembeli</th>
                 <th>Nominal Masuk</th>
-                <th style="width: 200px;">Aksi</th>
+                <th style="width: 250px;">Aksi</th>
             </tr>
         </thead>
         <tbody>
@@ -10115,6 +10143,26 @@ def approve_payment(order_id):
         return redirect(url_for('verify_payments', success="Pembayaran dikonfirmasi & Jurnal tercatat!"))
         
     return redirect(url_for('verify_payments', error="Gagal verifikasi"))
+
+@app.route("/admin/reject-payment/<order_id>", methods=['POST'])
+def reject_payment(order_id):
+    """Menolak pembayaran: Ubah status jadi 'rejected' (Gagal)"""
+    if session.get('role') != 'admin': return redirect(url_for('index'))
+    
+    db = get_db()
+    
+    # Cek transaksi
+    trx = db.execute("SELECT * FROM online_payments WHERE order_id = ?", (order_id,)).fetchone()
+    
+    if trx and trx['status'] == 'pending':
+        # Update status jadi rejected
+        with db:
+            db.execute("UPDATE online_payments SET status = 'rejected' WHERE order_id = ?", (order_id,))
+            
+        # Redirect kembali dengan pesan sukses
+        return redirect(url_for('verify_payments', error="Pembayaran telah ditolak. Status konsumen berubah menjadi Gagal."))
+        
+    return redirect(url_for('verify_payments', error="Gagal memproses penolakan."))
 
 # --- Menjalankan Aplikasi ---
 if __name__ == '__main__':
