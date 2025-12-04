@@ -16,7 +16,7 @@ from werkzeug.utils import secure_filename
 
 # --- Konfigurasi Aplikasi ---
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'kunci-rahasia-yang-sangat-aman-12345'
+app.config['SECRET_KEY'] = 'dfd821d60dca7ebf771468523143a11845a0130535943dcd947af9a978a32d59'
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30)
 DATABASE = 'accounting.db'
 
@@ -34,7 +34,7 @@ if not os.path.exists(UPLOAD_FOLDER):
 # ⿡ KONFIGURASI EMAIL (Gunakan App Password BARU Anda)
 # =========================
 EMAIL_PENGIRIM = "sigrameei@gmail.com"
-PASSWORD_EMAIL = "knjw eqmm elga fdce" #
+PASSWORD_EMAIL = "knjw eqmm elga fdce"
 
 UPLOAD_FOLDER = 'static/uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -1915,7 +1915,6 @@ def login():
     else:
         # Jika data tidak ada atau password salah, kirim pesan error
         return redirect(url_for('index', error="Email atau Password salah."))
-        return redirect(url_for('index', error="Email atau Password salah.")) 
 
 # --- GANTI BAGIAN INI DI DALAM FILE PYTHON ANDA ---
 
@@ -4296,7 +4295,7 @@ def opening_balance():
                         <div style="flex: 1;">
                             <small>Masa Manfaat (Thn):</small>
                             <input type="number" name="masa_manfaat_{code}" id="masa_manfaat_{code}" 
-                                   value="{default_life}" min="1" 
+                                   value="{default_life}" min="1"
                                    style="width: 100%; padding: 4px; border: 1px solid #ddd;"
                                    onkeyup="hitungPenyusutan('{code}')" onchange="hitungPenyusutan('{code}')">
                         </div>
@@ -5574,7 +5573,7 @@ def generate_ledger_html(account_code, db):
             
         table_rows += f"""
         <tr>
-            <td>{entry_date}</td> 
+            <td>{entry_date}</td>
             <td>{description}</td>
             <td class="currency">{format_currency(trx['debit'])}</td>
             <td class="currency">{format_currency(trx['credit'])}</td>
